@@ -1,0 +1,12 @@
+{
+ "frozenAt": "2026-11-17",
+ "packVersion": "assessor/v2.3+956b16efb7ea",
+ "hash": "sha256, unpadded base64url",
+ "note": "Frozen before any test-split run. Text = candidate v23-d (v2.2 text + the two card/v2 field descriptions); mapping keys chosen on dev.",
+ "files": {
+  "pack.json": "vZKDQV6yaS_SKNS-2aj5ClKpQF6T5GQrMnNEooenRbs",
+  "instructions.md": "ApiuaJSr6sc6fbT_HaLpEE7amxm7uZnJTUarHwbsXnc",
+  "rules.json": "V2hXZ3dUMqB93WB0W8Nx7CwNAzELtomTc1QmICXzFEA",
+  "examples.json": "CmEVSsYA7_t5xJWpsBpO1_SNVPYiNeeFYF7lWxkklRE"
+ }
+}

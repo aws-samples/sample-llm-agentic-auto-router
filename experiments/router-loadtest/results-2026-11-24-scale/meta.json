@@ -1,0 +1,11 @@
+{
+  "model": "auto:fast",
+  "max_out": 8,
+  "procs": 4,
+  "stages": "40:720",
+  "stage_s": 180,
+  "idle_s": 0,
+  "cluster": "<prefix>-cluster",
+  "logGroup": "/llmar/router",
+  "started": 1795515368.1861746
+}

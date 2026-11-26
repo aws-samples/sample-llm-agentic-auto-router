@@ -1,0 +1,19 @@
+# Reviewed gitleaks false positives (generic-api-key), pinned by fingerprint <commit>:<file>:<rule>:<line>.
+# None is a credential: model ids in experiment plans, a fake fixture in the leak-scanner tests,
+# placeholder ARNs/VPC endpoint ids in CDK tests, and a prompt-cache key in assessor tests.
+# Current copies of the flagged lines carry an inline gitleaks:allow where the file format allows comments.
+6f0e42e7e0a0ebd490a0503576fdcc164c6e5521:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:215
+6f0e42e7e0a0ebd490a0503576fdcc164c6e5521:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:90
+6f0e42e7e0a0ebd490a0503576fdcc164c6e5521:infra/src/stack.test.ts:generic-api-key:484
+753dc4c0830bbf66f2c3fd9b487baa8ed66b9891:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:215
+833cd48e7623402e784784cff03fa28dc887847e:infra/src/stack.test.ts:generic-api-key:484
+846992d679e3dba96f5173f5419ee7de338b69e1:packages/assessor/src/adapters/adapters.test.ts:generic-api-key:31
+a83da2f33331015c965f6ab023d7c7b907e0972c:packages/assessor/src/adapters/adapters.test.ts:generic-api-key:31
+bec233339b803b5f1ed816d6887df0aee2f411c8:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:90
+e00855eae2fc3d123cad177510d5cee1b7f75eae:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:215
+e00855eae2fc3d123cad177510d5cee1b7f75eae:experiments/deepswe-harbor/tests/test_leakscan.py:generic-api-key:90
+e6fd56882cdf1416901b76ba2a7a1686d8066a02:experiments/claude-code-harbor/arms.json:generic-api-key:8
+e6fd56882cdf1416901b76ba2a7a1686d8066a02:experiments/claude-code-harbor/arms.json:generic-api-key:9
+e6fd56882cdf1416901b76ba2a7a1686d8066a02:experiments/claude-code-harbor/deepswe/plan.json:generic-api-key:35
+e6fd56882cdf1416901b76ba2a7a1686d8066a02:experiments/claude-code-harbor/tb21/plan.json:generic-api-key:39
+eb4201bb67d66d988eb47665f247759d52007c41:infra/src/stack.test.ts:generic-api-key:484

@@ -1,0 +1,18 @@
+# LiteLLM proxy in front of LLM Agentic Auto Router. See docs/integrations/litellm.zh-CN.md.
+# No secrets here: the router token is injected per call by llmar_auth.py, the rest comes from the environment.
+model_list:
+  # OpenAI dialect: /v1/chat/completions and /v1/responses go to the router's OpenAI endpoints.
+  - model_name: router-auto
+    litellm_params: {model: openai/auto, api_base: os.environ/LLMAR_OPENAI_BASE, api_key: set-by-llmar-auth}
+  - model_name: router-auto-fast
+    litellm_params: {model: openai/auto:fast, api_base: os.environ/LLMAR_OPENAI_BASE, api_key: set-by-llmar-auth}
+  # Anthropic dialect: /v1/messages goes to the router's Anthropic Messages endpoint.
+  - model_name: router-auto-claude
+    litellm_params: {model: anthropic/auto, api_base: os.environ/LLMAR_ANTHROPIC_BASE, api_key: set-by-llmar-auth}
+
+litellm_settings:
+  callbacks: llmar_auth.proxy_handler_instance   # llmar_auth.py sits next to this file
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  forward_client_headers_to_llm_api: true        # passes x-router-session / x-router-hint through

@@ -1,0 +1,23 @@
+[
+ {
+  "start": "2026-11-24T10:46:29.188000+00:00",
+  "end": "2026-11-24T10:47:00.092000+00:00",
+  "status": "Successful",
+  "desc": "Setting desired count to 2.",
+  "cause": "monitor alarm TargetTracking-service/llmar-cluster/llmar-router-AlarmLow-9d5b1dcc-50bb-4c2e-8d09-5bb74836d644 in state ALARM triggered policy llmar-router-cpu"
+ },
+ {
+  "start": "2026-11-24T10:22:24.132000+00:00",
+  "end": "2026-11-24T10:23:33.260000+00:00",
+  "status": "Successful",
+  "desc": "Setting desired count to 3.",
+  "cause": "monitor alarm TargetTracking-service/llmar-cluster/llmar-router-AlarmHigh-79e0ca48-e232-4f79-a06d-8bb04de9eb91 in state ALARM triggered policy llmar-router-cpu"
+ },
+ {
+  "start": "2026-11-24T09:37:01.580000+00:00",
+  "end": "2026-11-24T09:38:07.790000+00:00",
+  "status": "Successful",
+  "desc": "Setting desired count to 2.",
+  "cause": "minimum capacity was set to 2"
+ }
+]

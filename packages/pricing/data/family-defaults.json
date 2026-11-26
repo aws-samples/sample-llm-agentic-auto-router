@@ -1,0 +1,189 @@
+{
+  "$comment": "Templates for models that discovery finds and data/models.json does not list (src/templates.ts). A new model first inherits from the newest confirmed model of the same provider + line + endpoint scope; these family defaults apply only when there is none. Fields an API reports (availability, lifecycle, SKU name, billed cache TTLs, long-context presence, prices) never come from here. Templated values are proposals: the model stays pending until an admin confirms it. `discovery` sets which Region ids are added on their own: by default global profiles and in-Region on-demand models of providers listed in `families`; add \"geo\" to `scopes` to discover geographic profiles (only those without a global profile while `geoOnlyWithoutGlobal` is true).  `defaults.serviceTier` is the Bedrock service tier the router sends when the client sends none (kimi and glm: flex; the account's Standard quota for them is 0). Regenerate src/meta.data.ts with scripts/gen-catalog.ts after editing.",
+  "schemaVersion": 1,
+  "families": [
+    {
+      "family": "claude",
+      "match": {
+        "providers": [
+          "anthropic"
+        ],
+        "linePrefix": "claude"
+      },
+      "defaults": {
+        "dialects": [
+          "anthropic-messages"
+        ],
+        "contextWindow": 1000000,
+        "cache": {
+          "mode": "explicit",
+          "minTokens": 1024,
+          "ttls": [
+            "5m",
+            "1h"
+          ],
+          "defaultTtl": "5m"
+        },
+        "longContextAboveTokens": 200000
+      },
+      "sku": {
+        "schemes": [
+          "claude",
+          "claude-legacy"
+        ],
+        "names": [
+          "{modelName}"
+        ]
+      }
+    },
+    {
+      "family": "gpt",
+      "match": {
+        "providers": [
+          "openai"
+        ],
+        "linePrefix": "gpt",
+        "excludeLinePrefixes": [
+          "gpt-oss"
+        ]
+      },
+      "defaults": {
+        "dialects": [
+          "openai-chat",
+          "openai-responses"
+        ],
+        "contextWindow": 1000000,
+        "cache": {
+          "mode": "both",
+          "minTokens": 1024,
+          "ttls": [
+            "30m"
+          ],
+          "defaultTtl": "30m"
+        },
+        "longContextAboveTokens": 272000
+      },
+      "sku": {
+        "schemes": [
+          "gpt"
+        ],
+        "names": [
+          "OpenAI {modelName}",
+          "{modelName}"
+        ]
+      }
+    },
+    {
+      "family": "kimi",
+      "match": {
+        "providers": [
+          "moonshotai",
+          "moonshot"
+        ],
+        "linePrefix": "kimi"
+      },
+      "defaults": {
+        "dialects": [
+          "openai-chat"
+        ],
+        "contextWindow": 256000,
+        "cache": {
+          "mode": "both",
+          "minTokens": 256,
+          "ttls": [
+            "30m"
+          ],
+          "defaultTtl": "30m"
+        },
+        "serviceTier": "flex"
+      },
+      "sku": {
+        "schemes": [
+          "mantle"
+        ],
+        "names": [
+          "{modelName}"
+        ],
+        "prefixes": {
+          "global": "{baseId}-mantle",
+          "geo": "{baseId}-mantle",
+          "in-region": "{baseId}"
+        }
+      }
+    },
+    {
+      "family": "glm",
+      "match": {
+        "providers": [
+          "zai"
+        ],
+        "linePrefix": "glm"
+      },
+      "defaults": {
+        "dialects": [
+          "openai-chat",
+          "openai-responses"
+        ],
+        "contextWindow": 200000,
+        "cache": {
+          "mode": "none",
+          "minTokens": 0,
+          "ttls": [],
+          "defaultTtl": "5m"
+        },
+        "serviceTier": "flex"
+      },
+      "sku": {
+        "schemes": [
+          "mantle"
+        ],
+        "names": [
+          "{modelName}"
+        ],
+        "prefixes": {
+          "global": "{baseId}-mantle",
+          "geo": "{baseId}-mantle",
+          "in-region": "{baseId}"
+        }
+      }
+    }
+  ],
+  "tierRules": [
+    {
+      "pattern": "(^|-)(opus|fable|astra)(-|$)",
+      "tier": "frontier"
+    },
+    {
+      "pattern": "(^|-)(sonnet|sol|terra)(-|$)",
+      "tier": "standard"
+    },
+    {
+      "pattern": "(^|-)(haiku|luna|lite|micro)(-|$)",
+      "tier": "fast"
+    }
+  ],
+  "defaultTier": "standard",
+  "unclassified": {
+    "family": "other",
+    "dialects": [
+      "openai-chat"
+    ],
+    "contextWindow": 128000,
+    "cache": {
+      "mode": "none",
+      "minTokens": 0,
+      "ttls": [],
+      "defaultTtl": "5m"
+    }
+  },
+  "discovery": {
+    "scopes": [
+      "global",
+      "in-region"
+    ],
+    "knownProvidersOnly": [
+      "in-region"
+    ],
+    "geoOnlyWithoutGlobal": true
+  }
+}

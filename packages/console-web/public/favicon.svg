@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="LLM Agentic Auto Router">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0f24"/>
+      <stop offset="1" stop-color="#241552"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <!-- a faint edge keeps the square readable on dark tab strips and dark top bars -->
+  <rect x="1" y="1" width="62" height="62" rx="13" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-width="2"/>
+  <!-- one agent request in, three tiers out; the warm path (standard) is the bright one. Strokes and dots are sized
+       so the three branches stay apart at 16 px (1 px = 4 units). -->
+  <path d="M5 32H11" stroke="#7dd3fc" stroke-width="6" stroke-linecap="round"/>
+  <path d="M28 32C38 32 38 14 47 14" stroke="#a78bfa" stroke-width="6.5" stroke-linecap="round" fill="none"/>
+  <path d="M28 32C38 32 38 50 47 50" stroke="#5eead4" stroke-width="6.5" stroke-linecap="round" fill="none"/>
+  <path d="M28 32H47" stroke="#38bdf8" stroke-width="7.5" stroke-linecap="round"/>
+  <circle cx="20" cy="32" r="9" fill="#0f172a" stroke="url(#core)" stroke-width="6"/>
+  <circle cx="20" cy="32" r="3.5" fill="#ffffff"/>
+  <circle cx="51" cy="14" r="7" fill="#a78bfa"/>
+  <circle cx="51" cy="32" r="8" fill="#22d3ee"/>
+  <circle cx="51" cy="50" r="7" fill="#5eead4"/>
+</svg>
