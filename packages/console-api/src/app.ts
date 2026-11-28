@@ -14,6 +14,7 @@ import { configHandlers } from './routes/config.ts'
 import { customRuleHandlers } from './routes/custom-rules.ts'
 import { meHandlers } from './routes/me.ts'
 import { memberHandlers } from './routes/members.ts'
+import { providerHandlers } from './routes/providers.ts'
 
 export interface Ctx {
   event: HttpApiEvent
@@ -27,7 +28,7 @@ export type Handler = (ctx: Ctx) => Promise<Reply>
 export type HandlerId = RouteId
 
 /** Every contract route has exactly one handler (a missing one is a type error). */
-export const HANDLERS: Record<string, Handler> = { ...meHandlers, ...configHandlers, ...adminDataHandlers, ...memberHandlers, ...rulesHandlers, ...familyHandlers, ...customRuleHandlers, ...catalogHandlers }
+export const HANDLERS: Record<string, Handler> = { ...meHandlers, ...configHandlers, ...adminDataHandlers, ...memberHandlers, ...rulesHandlers, ...familyHandlers, ...customRuleHandlers, ...catalogHandlers, ...providerHandlers }
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
 

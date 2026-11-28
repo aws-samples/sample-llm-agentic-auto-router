@@ -17,7 +17,7 @@ function check(args: string[], cwd = PKG): { status: number | null; out: string 
 
 describe('runs under plain Node (strip-only type stripping)', () => {
   it('every Lambda entry imports, and no runtime file uses strip-unsupported syntax', () => {
-    const r = check(['--import', 'src/grant-handler.ts', '--import', 'src/cleanup-handler.ts', '--import', 'src/refresh-handler.ts', 'src'])
+    const r = check(['--import', 'src/grant-handler.ts', '--import', 'src/cleanup-handler.ts', '--import', 'src/refresh-handler.ts', '--import', 'src/provider-dns-handler.ts', 'src'])
     expect(r.out).toMatch(/PASS/)
     expect(r.status).toBe(0)
   }, 90_000)

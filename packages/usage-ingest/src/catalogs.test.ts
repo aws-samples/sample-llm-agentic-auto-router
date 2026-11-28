@@ -1,7 +1,7 @@
 // Dynamic catalog C3: lines are priced with the catalog version they name (catalog/versions/<v>.json), the bundled
 // catalog when it is the line's, and excluded as catalog-mismatch only when neither has it.
 import { describe, expect, it } from 'vitest'
-import { catalogKeys, type PriceCatalog } from '@auto-router/pricing'
+import { catalogKeys, providerKeys, type PriceCatalog } from '@auto-router/pricing'
 import { F1, F2, fxCatalog, fxPolicies } from './__fixtures__/fx.ts'
 import { createCatalogResolver, NO_CATALOG, type CatalogVersionStore } from './catalogs.ts'
 import { ingest, type IngestDeps } from './ingest.ts'
@@ -121,5 +121,87 @@ describe('ingest with catalog versions', () => {
     const lines = F1.map((l) => lineAt(l, '2026-11-01.1'))
     await ingest(payload(lines), deps(s, { catalog: NO_CATALOG, catalogs: createCatalogResolver({ store, region: 'fx' }) }))
     expect([s.sum('A#', 'ex_catalog-mismatch'), s.sum('A#', 'spend')]).toEqual([1, 14_937_500])
+  })
+})
+
+describe('catalog versions with a provider registry (<catalog>+<registry>)', () => {
+  const fast = fxCatalog.models.find((m) => m.modelId === 'fx.fast')!
+  const registry = (version: string) => ({
+    schemaVersion: 1, version,
+    providers: [{
+      id: 'ext', baseUrl: 'https://llm.internal.example', auth: { scheme: 'none' },
+      models: [{ upstreamModel: 'fast', family: 'claude', tier: 'fast', dialects: ['anthropic-messages'], contextWindow: 1_000_000, price: fast.price, cache: fast.cache }],
+    }],
+  })
+  function bucket(map: Record<string, unknown>) {
+    const reads: string[] = []
+    const store: CatalogVersionStore = {
+      async read(key) {
+        reads.push(key)
+        const v = map[key]
+        if (v === 'throw') throw Object.assign(new Error('denied'), { name: 'AccessDenied' })
+        return v === undefined ? undefined : typeof v === 'string' ? v : JSON.stringify(v)
+      },
+    }
+    return { store, reads }
+  }
+  const resolver = (map: Record<string, unknown>, logs: Record<string, unknown>[] = []) => {
+    const b = bucket(map)
+    return { ...b, r: createCatalogResolver({ bundled: at(CUR), store: b.store, region: 'fx', log: (e) => logs.push(e) }) }
+  }
+
+  it('merges the bundled catalog with the bucket registry, cached', async () => {
+    const { r, reads } = resolver({ [providerKeys.version('r1')]: registry('r1') })
+    const c = await r.get(`${CUR}+r1`)
+    expect(c?.version).toBe(`${CUR}+r1`)
+    expect(c?.models.find((m) => m.modelId === 'ext/fast')).toMatchObject({ provider: 'ext', priceSource: 'provider-registry:r1' })
+    expect(await r.get(`${CUR}+r1`)).toBe(c)
+    expect(reads).toEqual([providerKeys.version('r1')])
+  })
+  it('the catalog part may come from the bucket', async () => {
+    const { r, reads } = resolver({ [catalogKeys.version(PREV)]: at(PREV), [providerKeys.version('r1')]: registry('r1') })
+    expect((await r.get(`${PREV}+r1`))?.version).toBe(`${PREV}+r1`)
+    expect(reads).toEqual([catalogKeys.version(PREV), providerKeys.version('r1')])
+  })
+  it('an absent, invalid or mismatched registry (or catalog part) resolves to nothing', async () => {
+    const logs: Record<string, unknown>[] = []
+    const { r } = resolver({
+      [providerKeys.version('bad')]: { schemaVersion: 1, version: 'bad', providers: [{ id: 'bedrock' }] },
+      [providerKeys.version('other')]: registry('r9'),
+      [providerKeys.version('r1')]: registry('r1'),
+    }, logs)
+    expect(await r.get(`${CUR}+missing`)).toBeUndefined()
+    expect(await r.get(`${CUR}+bad`)).toBeUndefined()
+    expect(await r.get(`${CUR}+other`)).toBeUndefined()
+    expect(await r.get('2026-11-01.1+r1')).toBeUndefined()
+    expect(logs).toEqual([
+      { kind: 'ingest-registry', outcome: 'absent', version: 'missing' },
+      { kind: 'ingest-registry', outcome: 'rejected', version: 'bad', code: 'registry-invalid' },
+      { kind: 'ingest-registry', outcome: 'rejected', version: 'other', code: 'version-mismatch' },
+      { kind: 'ingest-catalog', outcome: 'absent', version: '2026-11-01.1' },
+    ])
+  })
+  it('malformed composite versions are never read', async () => {
+    const { r, reads } = resolver({})
+    for (const v of [`${CUR}+`, `${CUR}+a+b`, `+r1`, `fx-x+r1`, `${CUR}+a/b`]) expect(await r.get(v)).toBeUndefined()
+    expect(reads).toEqual([])
+  })
+  it('a registry read failure is rethrown', async () => {
+    const { r } = resolver({ [providerKeys.version('r1')]: 'throw' })
+    await expect(r.get(`${CUR}+r1`)).rejects.toThrow('denied')
+  })
+  it('ingest prices a line served by a registry model', async () => {
+    const { store } = bucket({ [providerKeys.version('r1')]: registry('r1') })
+    const catalogs = createCatalogResolver({ bundled: fxCatalog, store, region: 'fx' })
+    const ext = F1.map((l) => ({ ...lineAt(l, 'fx-1+r1'), servedModel: 'ext/fast', decision: { ...l.decision!, model: 'ext/fast' } }) as RouterLine)
+    const deps = (s: FakeStore): IngestDeps => ({ catalog: fxCatalog, catalogs, policies: mapPolicies(fxPolicies), store: s, retentionDays: 90, now: () => NOW, sleep: async () => {} })
+    const s = new FakeStore()
+    await ingest(payload(ext), deps(s))
+    expect(s.sum('A#', 'ex_catalog-mismatch')).toBe(0)
+    const same = new FakeStore()
+    await ingest(payload(F1), deps(same))
+    expect(same.sum('A#', 'spend')).toBeGreaterThan(0)
+    expect(s.sum('A#', 'spend')).toBe(same.sum('A#', 'spend'))
+    expect(s.records().map((x) => x.catalogVersion)).toEqual(['fx-1+r1'])
   })
 })

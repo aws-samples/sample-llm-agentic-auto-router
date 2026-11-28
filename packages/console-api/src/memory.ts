@@ -6,7 +6,7 @@ import { HttpError } from './http.ts'
 import type { Delivery, StoredVersion } from './local-types.ts'
 import type {
   ActivePointer, AuditQuery, ClientDirectory, ConfigReport, ConsoleStore, Directory, DirectoryUser, Draft, GatewayReader, MemberSettings,
-  CustomRuleRollupItem, FunctionInvoker, MetricsReader, ObjectStore, FamilyRollupItem, RecordScan, RollupItem, RouterTasks, StateReport, StoredRecord, UsageStore,
+  CustomRuleRollupItem, FunctionInvoker, MetricsReader, ObjectStore, FamilyRollupItem, ProviderKeyStore, RecordScan, RollupItem, RouterTasks, StateReport, StoredRecord, UsageStore,
 } from './ports.ts'
 
 const clone = <T>(v: T): T => structuredClone(v)
@@ -139,13 +139,49 @@ export class MemoryObjectStore implements ObjectStore {
   async listKeys(prefix: string) { return [...this.objects.keys()].filter((k) => k.startsWith(prefix)).sort() }
 }
 
-/** Records asynchronous invokes; `fail` makes one throw. */
+/**
+ * Provider keys in memory (Secrets Manager semantics: a deleted key is scheduled, restorable, and counts as not set).
+ * `values` holds what was written so tests can check a key reached the store; no port method returns it.
+ */
+export class MemoryProviderKeys implements ProviderKeyStore {
+  values = new Map<string, { value: string; updatedAt: string; tags: Record<string, string>; deleted?: { recoveryDays: number } }>()
+  calls: Array<{ op: string; name: string }> = []
+  fail: ((op: string) => boolean) | undefined
+  now: () => number = () => Date.now()
+  private check(op: string, name: string) {
+    this.calls.push({ op, name })
+    if (this.fail?.(op)) throw Object.assign(new Error('injected secrets failure'), { name: 'AccessDeniedException' })
+  }
+  async status(name: string) {
+    this.check('describe', name)
+    const v = this.values.get(name)
+    return v && !v.deleted ? { updatedAt: v.updatedAt } : undefined
+  }
+  async put(name: string, value: string, tags: Readonly<Record<string, string>>) {
+    this.check('put', name)
+    const cur = this.values.get(name)
+    this.values.set(name, { value, updatedAt: new Date(this.now()).toISOString(), tags: cur?.tags ?? { ...tags } })
+  }
+  async delete(name: string, recoveryDays: number) {
+    this.check('delete', name)
+    const cur = this.values.get(name)
+    if (cur && !cur.deleted) cur.deleted = { recoveryDays }
+  }
+}
+
+/** Records invokes (asynchronous and synchronous); `fail` makes one throw; `result` answers synchronous ones. */
 export class MemoryInvoker implements FunctionInvoker {
-  calls: Array<{ functionName: string; payload: Record<string, unknown> }> = []
+  calls: Array<{ functionName: string; payload: Record<string, unknown>; sync?: true }> = []
   fail: ((functionName: string) => boolean) | undefined
+  result: ((functionName: string, payload: Record<string, unknown>) => unknown) | undefined
   async invokeAsync(functionName: string, payload: Record<string, unknown>) {
     if (this.fail?.(functionName)) throw Object.assign(new Error('injected invoke failure'), { name: 'ServiceException' })
     this.calls.push({ functionName, payload: structuredClone(payload) })
+  }
+  async invokeSync(functionName: string, payload: Record<string, unknown>) {
+    if (this.fail?.(functionName)) throw Object.assign(new Error('injected function error'), { name: 'FunctionError' })
+    this.calls.push({ functionName, payload: structuredClone(payload), sync: true })
+    return this.result?.(functionName, payload) ?? { outcome: 'synced' }
   }
 }
 

@@ -4,14 +4,21 @@
 // 'unknown' and its values are absent; the console never guesses 'off' or 'observe'.
 import type { ConfigSectionName, EffectiveSetting, EffectiveSettings, IdentityKeysState, ReportedConfig, SettingSource } from '@auto-router/console-contract'
 import { hasAssessorAdapter } from '@auto-router/router'
+import { mergeRegistry, type ProviderRegistry } from '@auto-router/pricing'
 import { BAKED_VERSION_RE, SECTIONS as ROUTER_SECTIONS, validateConfigDocument } from '@auto-router/router/settings'
 import { HttpError } from './http.ts'
 import { packInfo, runningPacks } from './routes/packs.ts'
 import type { ConfigDocument, StoredVersion } from './local-types.ts'
 import type { ConfigReport, Deps, StateReport } from './ports.ts'
+import { documentSection, registryOf, sectionRegistry } from './providers.ts'
 
 export const BAKED_KEY = 'config/baked.json'
-export const SECTIONS: readonly ConfigSectionName[] = ROUTER_SECTIONS
+/**
+ * The sections every effective document has (the router's, without `providers`: WP-E may list it there too). The
+ * providers section (ADR 0002) is optional: absent = the deploy-time registry.
+ */
+const REQUIRED_SECTIONS = ROUTER_SECTIONS.filter((s) => (s as string) !== 'providers') as Array<Exclude<ConfigSectionName, 'providers'>>
+export const SECTIONS: readonly ConfigSectionName[] = [...REQUIRED_SECTIONS, 'providers']
 /** "0-baked.<sha8>" (0d §2, router BAKED_VERSION_RE); the legacy "0-baked" is accepted too. Group 1 = sha8. */
 export const BAKED_VERSION = BAKED_VERSION_RE
 const RECENT_MS = 7 * 86_400_000
@@ -33,8 +40,18 @@ async function bakedOf(text: string, deps: Deps): Promise<ConfigDocument | undef
   if (!isObj(v) || typeof v.version !== 'string' || !BAKED_VERSION.test(v.version)) return undefined
   // bakedConfigDocument returns the router's runtime `seq` too: not a document field (drafts start from this).
   const { seq: _, ...doc } = v
+  // The providers section (ADR 0002) is the deployer's providersFile: schema-checked here, the policy validated with its
+  // models (without a section, with the legacy providers/active.json registry, as the router of that deploy runs).
+  const { providers: _p, ...rest } = doc
+  let registry: ProviderRegistry | undefined
+  try {
+    const section = documentSection(doc)
+    registry = section === 'absent' ? await registryOf(deps) : sectionRegistry(section, v.version)
+  } catch { deps.log({ kind: 'console-api-baked-invalid', issues: 1 }); return undefined }
+  let catalog = deps.catalog
+  try { if (registry) catalog = mergeRegistry(catalog, registry) } catch { deps.log({ kind: 'console-api-baked-invalid', issues: 1 }); return undefined }
   const packs = (await runningPacks(deps)).packs.map(packInfo)
-  const r = validateConfigDocument(doc, deps.catalog, { assessor: { catalog: deps.catalog, packs, hasAdapter: hasAssessorAdapter } })
+  const r = validateConfigDocument(rest, catalog, { assessor: { catalog, packs, hasAdapter: hasAssessorAdapter } })
   if (!r.ok) { deps.log({ kind: 'console-api-baked-invalid', issues: r.issues.length }); return undefined }
   return doc as unknown as ConfigDocument
 }
@@ -80,6 +97,8 @@ export interface Effective {
   /** Complete effective document (every section known): what a new draft starts from. */
   document?: ConfigDocument
   settings: EffectiveSettings
+  /** The deploy-time providers section (baked.json's, else the legacy registry's); absent when the deploy has none. */
+  bakedProviders?: NonNullable<ConfigDocument['providers']>
 }
 
 export async function effectiveConfig(deps: Deps): Promise<Effective> {
@@ -91,13 +110,19 @@ export async function effectiveConfig(deps: Deps): Promise<Effective> {
   const sources = {} as Record<ConfigSectionName, SettingSource>
   const versions = {} as Record<ConfigSectionName, string | undefined>
   const values: Effective['values'] = {}
-  for (const s of SECTIONS) {
+  for (const s of REQUIRED_SECTIONS) {
     const fromDoc = active?.document[s]
     if (fromDoc !== undefined) { sources[s] = 'document'; versions[s] = active?.meta.version; (values as Obj)[s] = fromDoc; continue }
     const fromBaked = baked?.[s]
     if (fromBaked !== undefined) { sources[s] = 'baked'; versions[s] = baked?.version; (values as Obj)[s] = fromBaked; continue }
     sources[s] = 'unknown'
   }
+  // providers (ADR 0002): in the effective document only when the active document has the section, so a draft that
+  // leaves providers alone keeps running the deploy-time registry; that one is reported apart (bakedProviders).
+  const legacy = baked?.providers === undefined ? await registryOf(deps) : undefined
+  const bakedProviders = baked?.providers ?? (legacy ? { providers: legacy.providers } : undefined)
+  if (active?.document.providers !== undefined) { sources.providers = 'document'; values.providers = active.document.providers }
+  else sources.providers = baked || legacy ? 'baked' : 'unknown'
   const policy = values.policy as Obj | undefined
   const assessor = values.assessor as Obj | undefined
   const setting = <T>(s: ConfigSectionName, value: unknown): EffectiveSetting<T> => (sources[s] === 'unknown'
@@ -111,11 +136,11 @@ export async function effectiveConfig(deps: Deps): Promise<Effective> {
     assessorPack: setting('assessor', assessor?.pack),
     assessorModel: setting('assessor', assessor?.model),
   }
-  const complete = SECTIONS.every((s) => sources[s] !== 'unknown')
+  const complete = REQUIRED_SECTIONS.every((s) => sources[s] !== 'unknown')
   const document = complete
     ? { schemaVersion: 1 as const, version: active?.meta.version ?? baked?.version ?? '', ...(values as Pick<ConfigDocument, ConfigSectionName>) } as ConfigDocument
     : undefined
-  return { ...(active ? { active } : {}), ...(baked ? { baked } : {}), sources, values, ...(document ? { document } : {}), settings }
+  return { ...(active ? { active } : {}), ...(baked ? { baked } : {}), sources, values, ...(document ? { document } : {}), settings, ...(bakedProviders ? { bakedProviders } : {}) }
 }
 
 /** The latest config line per router task (last 7 days), with whether it matches the configured settings (0d §4.4). */

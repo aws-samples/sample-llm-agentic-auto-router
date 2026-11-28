@@ -8,18 +8,20 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import { ECSClient } from '@aws-sdk/client-ecs'
 import { LambdaClient } from '@aws-sdk/client-lambda'
 import { S3Client } from '@aws-sdk/client-s3'
-import { catalogRegions, findModel, loadCatalog } from '@auto-router/pricing'
+import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager'
+import { catalogRegions, findModel, loadCatalog, managedSecretName, validateBoundary, type EgressBoundary } from '@auto-router/pricing'
 import { bedrockTransport, createSigV4Signer } from '@auto-router/router'
 import { createHandler } from './app.ts'
 import { catalogView, withCatalog } from './catalog.ts'
 import { createRulesTranslator, type RulesTranslator } from './rules-translate.ts'
 import { DynamoConsoleStore, DynamoUsageStore, type Sender } from './aws/dynamo.ts'
+import { SecretsManagerKeyStore } from './aws/secrets.ts'
 import { AgentCoreGateway, CloudWatchHealth, CognitoClientDirectory, CognitoDirectory, EcsRouterTasks, LambdaInvoker, S3ObjectStore } from './aws/services.ts'
 import type { HttpApiEvent, HttpApiResult } from './http.ts'
 import type { BaseDeps } from './ports.ts'
 import { activeVersion, routerState } from './routes/config.ts'
 
-export interface AwsClients { dynamodb: Sender; s3: Sender; cognito: Sender; agentcore: Sender; cloudwatch: Sender; ecs: Sender; lambda?: Sender }
+export interface AwsClients { dynamodb: Sender; s3: Sender; cognito: Sender; agentcore: Sender; cloudwatch: Sender; ecs: Sender; lambda?: Sender; secretsmanager?: Sender }
 
 export class EnvError extends Error {
   constructor(missing: string[]) { super(`console-api: missing or invalid environment: ${missing.join(', ')}`); this.name = 'EnvError' }
@@ -35,7 +37,9 @@ const list = (v: string | undefined) => (v ?? '').split(',').map((x) => x.trim()
  * CODEX_OAUTH_PORT, IDENTITY_HEADER (empty = none; default x-api-key), REFRESH_DAYS (30), CATALOG_REGION (AWS_REGION),
  * METRICS_NAMESPACE (LlmAutoRouter), RECORD_RETENTION_DAYS (90), RESERVED_CLIENT_IDS (app clients never touched, besides CLI_CLIENT_ID),
  * CONSOLE_RULES_MODEL (rule translation model; empty or none = off), CATALOG_REFRESH_FUNCTION and CATALOG_GRANT_FUNCTION
- * (dynamic catalog C2b; both or neither).
+ * (dynamic catalog C2b; both or neither), PROVIDER_BOUNDARY (ADR 0002: the egress boundary as JSON; unset = mode none),
+ * PROVIDER_SECRET_PREFIX (managed provider keys `<prefix>/providers/<id>`; unset or none = keys cannot be stored) and
+ * PROVIDER_DNS_SYNC_FUNCTION (nat-dns, ADR 0003: invoked synchronously at activation; unset or none = no sync).
  *
  * The bundled catalog of the Region is optional (dynamic catalog C3): each request reads the bucket's current one and
  * falls back to it; a Region without either answers 503 catalog-unavailable wherever a price is needed.
@@ -60,6 +64,24 @@ export function depsFromEnv(env: NodeJS.ProcessEnv, clients: AwsClients): BaseDe
   const grantFn = env.CATALOG_GRANT_FUNCTION || undefined
   if ((refreshFn === undefined) !== (grantFn === undefined)) missing.push('CATALOG_REFRESH_FUNCTION and CATALOG_GRANT_FUNCTION (both or neither)')
   if (refreshFn && !clients.lambda) missing.push('lambda client')
+  // ADR 0002 (design §2.3): the deployment's egress boundary and the provider secret prefix (SSM parameters, via infra).
+  let providerBoundary: EgressBoundary | undefined
+  if (env.PROVIDER_BOUNDARY) {
+    try { providerBoundary = validateBoundary(JSON.parse(env.PROVIDER_BOUNDARY)) } catch { missing.push('PROVIDER_BOUNDARY (a JSON egress boundary)') }
+  }
+  // 'none' (a deploy without an egress mode, infra's SSM value) or unset: keys cannot be stored.
+  const secretPrefix = env.PROVIDER_SECRET_PREFIX && env.PROVIDER_SECRET_PREFIX !== 'none' ? env.PROVIDER_SECRET_PREFIX : undefined
+  if (secretPrefix) {
+    try { managedSecretName(secretPrefix, 'x') } catch { missing.push('PROVIDER_SECRET_PREFIX (a secret name prefix)') }
+    if (!clients.secretsmanager) missing.push('secretsmanager client')
+  }
+  // nat-dns (ADR 0003): 'none' (infra's SSM value in the other modes) or unset = no DNS allow list to keep in sync.
+  const dnsSyncFn = env.PROVIDER_DNS_SYNC_FUNCTION && env.PROVIDER_DNS_SYNC_FUNCTION !== 'none' ? env.PROVIDER_DNS_SYNC_FUNCTION : undefined
+  if (dnsSyncFn) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(dnsSyncFn)) missing.push('PROVIDER_DNS_SYNC_FUNCTION (a function name)')
+    if (providerBoundary?.mode !== 'nat-dns') missing.push('PROVIDER_DNS_SYNC_FUNCTION (only with a nat-dns PROVIDER_BOUNDARY)')
+    if (!clients.lambda) missing.push('lambda client')
+  }
   if (missing.length) throw new EnvError(missing)
   const domain = env.COGNITO_DOMAIN?.replace(/\/+$/, '')
   const console = new DynamoConsoleStore(clients.dynamodb, env.CONSOLE_TABLE as string)
@@ -112,8 +134,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv, clients: AwsClients): BaseDe
       identityHeader: env.IDENTITY_HEADER === undefined ? 'x-api-key' : env.IDENTITY_HEADER === '' ? null : env.IDENTITY_HEADER,
       refreshDays, modelUniverse: list(env.MODEL_UNIVERSE), retentionDays,
       ...(refreshFn && grantFn ? { catalogRefreshFunction: refreshFn, catalogGrantFunction: grantFn } : {}),
+      ...(providerBoundary ? { providerBoundary } : {}), ...(secretPrefix ? { providerSecretPrefix: secretPrefix } : {}),
+      ...(dnsSyncFn ? { providerDnsSyncFunction: dnsSyncFn } : {}),
     },
-    ...(refreshFn && clients.lambda ? { invoker: new LambdaInvoker(clients.lambda) } : {}),
+    ...((refreshFn || dnsSyncFn) && clients.lambda ? { invoker: new LambdaInvoker(clients.lambda) } : {}),
+    ...(secretPrefix && clients.secretsmanager ? { providerKeys: new SecretsManagerKeyStore(clients.secretsmanager) } : {}),
     ...(rules ? { rules } : {}),
     now: () => Date.now(),
     uuid: () => randomUUID(),
@@ -128,6 +153,7 @@ export function awsClients(region: string | undefined): AwsClients {
   return {
     dynamodb: new DynamoDBClient(o), s3: new S3Client(o), cognito: new CognitoIdentityProviderClient(o),
     agentcore: new BedrockAgentCoreControlClient(o), cloudwatch: new CloudWatchClient(o), ecs: new ECSClient(o), lambda: new LambdaClient(o),
+    secretsmanager: new SecretsManagerClient(o),
   }
 }
 

@@ -82,6 +82,19 @@ export class LambdaInvoker implements FunctionInvoker {
     // An Event invoke answers 202 once queued.
     if (r.StatusCode !== undefined && r.StatusCode !== 202) throw Object.assign(new Error(`invoke answered ${r.StatusCode}`), { name: 'InvokeStatus' })
   }
+  async invokeSync(functionName: string, payload: Record<string, unknown>): Promise<unknown> {
+    const r = await this.lambda.send(new InvokeCommand({ FunctionName: functionName, InvocationType: 'RequestResponse', Payload: new TextEncoder().encode(JSON.stringify(payload)) }))
+    const text = r.Payload ? new TextDecoder().decode(r.Payload) : ''
+    let out: unknown
+    try { out = text ? JSON.parse(text) : undefined } catch { out = undefined }
+    if (r.FunctionError) {
+      // { errorType, errorMessage }: the function's own message (provider-dns-sync's carry no secrets), clipped.
+      const m = (out as { errorMessage?: unknown } | undefined)?.errorMessage
+      throw Object.assign(new Error(typeof m === 'string' ? m.slice(0, 300) : `function error (${r.FunctionError})`), { name: 'FunctionError' })
+    }
+    if (r.StatusCode !== undefined && r.StatusCode !== 200) throw Object.assign(new Error(`invoke answered ${r.StatusCode}`), { name: 'InvokeStatus' })
+    return out
+  }
 }
 
 // ---------------------------------------------------------------- Cognito users

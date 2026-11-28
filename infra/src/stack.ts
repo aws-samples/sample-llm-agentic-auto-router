@@ -4,7 +4,8 @@
 //     -> SigV4 execute-api, managed private endpoint (routingDomain = execute-api VPC endpoint)
 //     -> private REST API (AWS_IAM; resource policy: the gateway role through this endpoint only)
 //     -> VPC link -> internal NLB (SG: no ingress; PrivateLink traffic only) -> ECS Fargate router
-//     -> bedrock-runtime / ECR / Logs interface endpoints + S3 gateway endpoint (no IGW, no NAT)
+//     -> bedrock-runtime / ECR / Logs interface endpoints + S3 gateway endpoint (no IGW, no NAT unless a provider
+//        egress mode adds them: firewall or nat-dns, egress.ts)
 //     -> with -c stateStore=dynamodb: the router state table through a DynamoDB gateway endpoint
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -16,11 +17,12 @@ import {
   CustomResource, custom_resources as cr, triggers,
 } from 'aws-cdk-lib'
 import { boundaryBedrockStatements, DEPLOY_INPUTS_KEY, DYN_POLICY_SLOTS, dynPolicyArn, GRANT_DRAINING_KEY, UNCONFIRM_DELAY_MS } from '@auto-router/catalog-service'
-import { catalogKeys } from '@auto-router/pricing'
+import { catalogKeys, managedSecretName, providerKeys } from '@auto-router/pricing'
 import type { Construct } from 'constructs'
 import { BAKED_KEY, bakedArtifact, bakedVersionKey, type BakedArtifact } from './baked.ts'
 import { routerParamName, type RouterParam } from './console-stack.ts'
 import { baseModelId, INVOKE_ACTIONS, invokeStatements, PROJECT_ACTIONS, responsesProjectStatement, type DeployModels } from './models.ts'
+import { EgressFirewall, EgressNatDns } from './egress.ts'
 import type { Settings } from './settings.ts'
 
 export const ROUTER_PORT = 8080
@@ -39,6 +41,8 @@ export const REQUEST_HEADERS = [
 /** Gateway rule priorities (lower number first): auto* and the catch-all both route only to the router. */
 export const RULE_PRIORITY = { auto: 100, catchAll: 1_000_000 } as const
 /** Identity objects the router reads from the config bucket (router identity.ts, runtime config). */
+/** providers/active.json of a deploy without -c providersFile (design 11-28 P3: the console reads it). */
+export const EMPTY_REGISTRY = { schemaVersion: 1, version: 'none', providers: [] } as const
 export const CONFIG_KEYS = { document: 'config/active.json', identityPrefix: 'identity/', jwks: 'identity/jwks.json' } as const
 /** jwks-sync period: a Cognito key rotation is picked up within this, plus the router's 30 s poll. */
 export const JWKS_SYNC_MINUTES = 5
@@ -82,6 +86,7 @@ const REPO_ROOT = new URL('../../', import.meta.url).pathname
 /** Image CMDs of infra/lambda/catalog.Dockerfile (one handler per function). */
 export const CATALOG_LAMBDA_CMD = {
   grant: 'handlers/catalog-grant.handler', grantCleanup: 'handlers/catalog-grant-cleanup.handler', refresh: 'handlers/catalog-refresh.handler',
+  providerDns: 'handlers/catalog-provider-dns.handler',
 } as const
 /** Catalog objects the router reads (C3): the pointer, the granted universe and the immutable versions. */
 export const ROUTER_CATALOG_READS = [catalogKeys.current, catalogKeys.universe, `${catalogKeys.versionsPrefix}*`] as const
@@ -259,6 +264,36 @@ export class RouterStack extends Stack {
       vpc.addInterfaceEndpoint(eid, { service, subnets, securityGroups: [endpointSg], privateDnsEnabled: true, open: false })
     }
     const s3Endpoint = vpc.addGatewayEndpoint('S3', { service: ec2.GatewayVpcEndpointAwsService.S3, subnets: [subnets] })
+    // External providers (design 11-28 §5, ADR 0001): private endpoints only, by explicit CIDR; routes and DNS are the
+    // deployer's. A registry with Secrets Manager secrets adds this VPC's secretsmanager endpoint.
+    for (const e of cfg.providerEgress ?? []) routerSg.addEgressRule(ec2.Peer.ipv4(e.cidr), ec2.Port.tcp(e.port), 'external provider endpoint (providerEgress)')
+    // Public provider egress (P2, egress.ts): only with an explicit providerEgressMode. firewall: NAT behind a Network
+    // Firewall that passes TLS on 443 to the registry's hostnames; nat-dns: NAT with a DNS Firewall that resolves only
+    // AWS service names and the registry's hostnames (ADR 0003); bring-your-own: the deployer's route and filtering.
+    // Both NAT modes use the construct id ProviderEgress: their shared NAT layer keeps its logical ids across a switch.
+    if (cfg.providerEgressMode === 'firewall' || cfg.providerEgressMode === 'nat-dns' || (cfg.providerEgressMode === 'bring-your-own' && !cfg.providerEgress?.length)) {
+      routerSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), `external providers on the internet (providerEgressMode=${cfg.providerEgressMode})`)
+    }
+    if (cfg.providerEgressMode === 'firewall') {
+      new EgressFirewall(this, 'ProviderEgress', { prefix: cfg.prefix, vpc, routerSubnets: vpc.isolatedSubnets, azIds: cfg.azIds, azs: cfg.providerEgressAzs ?? 2, hosts: models.egressHosts })
+    }
+    // nat-dns: the provider allow list's content is not in the template; provider-dns-sync (below) keeps it.
+    const natDns = cfg.providerEgressMode === 'nat-dns'
+      ? new EgressNatDns(this, 'ProviderEgress', { prefix: cfg.prefix, vpc, routerSubnets: vpc.isolatedSubnets, azIds: cfg.azIds, azs: cfg.providerEgressAzs ?? 2 })
+      : undefined
+    if (cfg.providerEgressMode === 'bring-your-own') {
+      new CfnOutput(this, 'RouterRouteTableIds', {
+        value: Fn.join(',', vpc.isolatedSubnets.map((x) => x.routeTable.routeTableId)),
+        description: 'providerEgressMode=bring-your-own: add your egress route (e.g. 0.0.0.0/0 to a transit gateway) to these route tables',
+      })
+    }
+    // Provider secrets (ADR 0002): the deployer's arns (providersFile) and, with any egress mode, the console-written
+    // `<prefix>/providers/*`. Read only through this VPC's secretsmanager endpoint.
+    const providerSecretResources = [...models.providerSecretArns,
+      ...(cfg.providerEgressMode ? [`arn:${Aws.PARTITION}:secretsmanager:${cfg.region}:${Aws.ACCOUNT_ID}:secret:${managedSecretName(cfg.prefix, 'x').replace(/x$/, '*')}`] : [])]
+    const secretsVpce = providerSecretResources.length
+      ? vpc.addInterfaceEndpoint('SecretsManager', { service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER, subnets, securityGroups: [endpointSg], privateDnsEnabled: true, open: false })
+      : undefined
 
     // ---------------------------------------------------------------- inbound auth: Cognito (machine clients and members)
     // Members are admin-created only (no self sign-up). MFA is off by deployer decision for this sample (the live pool's
@@ -468,6 +503,9 @@ export class RouterStack extends Stack {
     // Container Insights off: the router's EMF metrics cover requests, cost, errors and latency.
     const cluster = new ecs.Cluster(this, 'Cluster', { clusterName: n('cluster'), vpc, containerInsightsV2: ecs.ContainerInsights.DISABLED })
     const routerLogs = new logs.LogGroup(this, 'RouterLogs', { logGroupName: `/${cfg.prefix}/router`, retention: logs.RetentionDays.ONE_WEEK, removalPolicy: RemovalPolicy.DESTROY })
+    // Provider secrets (design 11-28 §5): exactly the registry's ARNs, read only, through this VPC's endpoint only.
+    const secretsGrant = secretsVpce ? (sid: string) => new iam.PolicyStatement({ sid, actions: ['secretsmanager:GetSecretValue'],
+      resources: providerSecretResources, conditions: { StringEquals: { 'aws:SourceVpce': secretsVpce.vpcEndpointId } } }) : undefined
     // Permissions boundary: what the router uses (Bedrock invoke on profiles, foundation models and the Responses
     // default project; read of the runtime config and identity objects; with -c stateStore=dynamodb the three item
     // actions on the state table through its endpoint) and nothing else. It caps the dynamic policies
@@ -482,6 +520,7 @@ export class RouterStack extends Stack {
         new iam.PolicyStatement({ sid: 'ConfigList', actions: ['s3:ListBucket'], resources: [configBucket.bucketArn] }),
         new iam.PolicyStatement({ sid: 'CatalogRead', actions: ['s3:GetObject'], resources: ROUTER_CATALOG_READS.map((k) => configBucket.arnForObjects(k)) }),
         ...(stateStore ? [stateStore.grant('StateStore')] : []),
+        ...(secretsGrant ? [secretsGrant('ProviderSecrets')] : []),
       ],
     })
     const taskRole = new iam.Role(this, 'TaskRole', {
@@ -500,11 +539,19 @@ export class RouterStack extends Stack {
       new iam.PolicyStatement({ sid: 'CatalogRead', actions: ['s3:GetObject'], resources: ROUTER_CATALOG_READS.map((k) => configBucket.arnForObjects(k)) })] })
     // State store: its own policy resource too (the role's default/overflow policies are the same in both modes).
     const taskStateStore = stateStore ? new iam.Policy(this, 'TaskRoleStateStore', { roles: [taskRole], statements: [stateStore.grant('StateStore')] }) : undefined
+    const taskProviderSecrets = secretsGrant ? new iam.Policy(this, 'TaskRoleProviderSecrets', { roles: [taskRole], statements: [secretsGrant('ProviderSecrets')] }) : undefined
     // ... and only through this VPC's S3 gateway endpoint.
     configBucket.addToResourcePolicy(new iam.PolicyStatement({ sid: 'RouterViaEndpointOnly', effect: iam.Effect.DENY,
       principals: [new iam.ArnPrincipal(taskRole.roleArn)], actions: ['s3:GetObject', 's3:ListBucket'],
       resources: [configBucket.bucketArn, configBucket.arnForObjects('*')],
       conditions: { StringNotEquals: { 'aws:SourceVpce': s3Endpoint.vpcEndpointId } } }))
+    // Provider secrets: the endpoint admits only the task role, only GetSecretValue, only the registry's ARNs. The role
+    // ARN is spelled out (as for the DynamoDB endpoint): the role's boundary names this endpoint, so a reference would
+    // be a cycle.
+    if (secretsVpce) secretsVpce.addToPolicy(new iam.PolicyStatement({
+      principals: [new iam.StarPrincipal()], actions: ['secretsmanager:GetSecretValue'], resources: providerSecretResources,
+      conditions: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${Aws.ACCOUNT_ID}:role/${taskRoleName}` } },
+    }))
     // bedrock-runtime endpoint: only the router task role, only model invocation.
     bedrockVpce.addToPolicy(new iam.PolicyStatement({
       principals: [new iam.ArnPrincipal(taskRole.roleArn)], actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], resources: ['*'],
@@ -527,6 +574,11 @@ export class RouterStack extends Stack {
       // The deploy's policy (validated against the region catalog at synth); the router re-validates it at boot.
       ROUTER_POLICY_JSON: JSON.stringify(models.policy),
       ...(models.catalog ? { ROUTER_CATALOG_JSON: JSON.stringify(models.catalog) } : {}),
+      // The provider registry (validated at synth; the router re-validates it at boot). Absent = Bedrock only.
+      ...(models.registry ? { ROUTER_PROVIDERS_JSON: JSON.stringify(models.registry) } : {}),
+      // The egress boundary console providers must lie in, and the console-written secrets' prefix (ADR 0002). Absent
+      // without an egress mode: the router then allows no providers other than Bedrock in a configuration document.
+      ...(cfg.providerEgressMode ? { ROUTER_PROVIDER_BOUNDARY: JSON.stringify(models.boundary), ROUTER_SECRET_PREFIX: cfg.prefix } : {}),
       ROUTER_HINTS: JSON.stringify({ chatIncludeUsage: 'inject-strip' }),
       // E2E task revisions only (-c e2eFault=… / -c e2eIdleTimeoutMs=…); the router logs a startup warning.
       ...(cfg.e2e?.fault ? { ROUTER_FAULT_INJECT: cfg.e2e.fault, ROUTER_FAULT_INJECT_ALLOW: '1' } : {}),
@@ -545,7 +597,8 @@ export class RouterStack extends Stack {
       ...(stateStore ? { ROUTER_STATE_TABLE: stateStore.table.tableName } : {}),
     }
     // The baked document comes from this exact env (the router reads the same keys at boot): staged below.
-    this.baked = bakedArtifact(models.policy, routerEnv)
+    // The providersFile registry is part of the baked document (ADR 0002), as the router builds it from ROUTER_PROVIDERS_JSON.
+    this.baked = bakedArtifact(models.policy, routerEnv, undefined, models.registry)
     const container = task.addContainer('router', {
       containerName: 'router', image, essential: true, readonlyRootFilesystem: true, user: 'node',
       portMappings: [{ name: 'http', containerPort: ROUTER_PORT, appProtocol: ecs.AppProtocol.http }],
@@ -572,6 +625,7 @@ export class RouterStack extends Stack {
     }
     // No task starts before the route to DynamoDB, the SG rule that lets it out and the role's grant exist (the service waits for the role and its default policy only).
     if (stateStore && taskStateStore) service.node.addDependency(stateStore.endpoint, taskStateStore, routerSg)
+    if (secretsVpce && taskProviderSecrets) service.node.addDependency(secretsVpce, taskProviderSecrets)
     // ---------------------------------------------------------------- jwks-sync (pool JWKS -> identity/jwks.json, every 5 min)
     // Outside the VPC (it reads the pool's public JWKS); writes one object. The router never fetches keys at request time.
     const jwksLogs = new logs.LogGroup(this, 'JwksSyncLogs', { logGroupName: `/aws/lambda/${n('jwks-sync')}`, retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY })
@@ -694,6 +748,8 @@ export class RouterStack extends Stack {
       serviceName: service.serviceName, serviceArn: service.serviceArn, cliClientId: cli.userPoolClientId, agentClientId: client.userPoolClientId,
       callbackPorts: cfg.identity.cliRedirectPorts.join(','), codexOauthPort: String(cfg.identity.codexOauthPort), modelUniverse: models.routerModels.join(','), identityHeader: 'x-api-key',
       catalogRefreshFunction: n('catalog-refresh'), catalogGrantFunction: grantFn.functionName,
+      providerBoundary: JSON.stringify(models.boundary), providerSecretPrefix: cfg.providerEgressMode ? cfg.prefix : 'none',
+      providerDnsSyncFunction: natDns ? n('provider-dns-sync') : 'none',
     }
     for (const [k, v] of Object.entries(params) as Array<[RouterParam, string]>) {
       new ssm.StringParameter(this, `Param-${k}`, { parameterName: routerParamName(cfg.prefix, k), stringValue: v, description: `llm-auto-router ${k} (read by the console stack)` })
@@ -716,6 +772,13 @@ export class RouterStack extends Stack {
       sources: [
         ...(props.packsArchiveDir ? [s3deploy.Source.asset(props.packsArchiveDir)] : []),
         s3deploy.Source.data(BAKED_KEY, this.baked.json), s3deploy.Source.data(bakedVersionKey(this.baked.version), this.baked.json),
+        // The deploy's registry, which the console reads: written on every deploy (the explicit empty registry without
+        // -c providersFile), so it never outlives the deploy that set it. Its immutable version, for usage-ingest's
+        // `<catalog>+<registry>` lines, only for a real registry.
+        s3deploy.Source.data(providerKeys.active, JSON.stringify(models.registry ?? EMPTY_REGISTRY)),
+        ...(models.registry ? [s3deploy.Source.data(providerKeys.version(models.registry.version), JSON.stringify(models.registry)),
+          // The router names the baked registry by the baked document's version (catalog `<catalog>+<baked version>`).
+          s3deploy.Source.data(providerKeys.version(this.baked.version), JSON.stringify({ ...models.registry, version: this.baked.version }))] : []),
       ],
     })
     // BucketDeployment grants its framework Lambda read/write on the whole bucket. Outside packs/ and the baked document
@@ -724,7 +787,9 @@ export class RouterStack extends Stack {
     configBucket.addToResourcePolicy(new iam.PolicyStatement({ sid: 'PacksDeploymentOnlyUnderPacks', effect: iam.Effect.DENY,
       principals: [new iam.ArnPrincipal(packs.handlerRole.roleArn)],
       actions: ['s3:PutObject', 's3:PutObjectAcl', 's3:DeleteObject', 's3:DeleteObjectVersion'],
-      notResources: [configBucket.arnForObjects('packs/*'), configBucket.arnForObjects(BAKED_KEY), configBucket.arnForObjects('config/baked/*')] }))
+      notResources: [configBucket.arnForObjects('packs/*'), configBucket.arnForObjects(BAKED_KEY), configBucket.arnForObjects('config/baked/*'),
+        configBucket.arnForObjects(providerKeys.active),
+        ...(models.registry ? [configBucket.arnForObjects(`${providerKeys.versionsPrefix}*`)] : [])] }))
     // ---------------------------------------------------------------- catalog-refresh (prices, availability, versions)
     // Outside the VPC (Price List us-east-1 endpoint, Bedrock control plane). Daily schedule, console "refresh now"
     // (async) and a deploy-time Trigger: after the bucket and the baked document, before the ECS service, so the router
@@ -762,6 +827,38 @@ export class RouterStack extends Stack {
     for (const id of ['Role', 'Handler']) {
       (trp?.node.tryFindChild(id) as CfnResource | undefined)?.addPropertyOverride('Tags', Object.entries(cfg.tags).map(([Key, Value]) => ({ Key, Value })))
     }
+    // ---------------------------------------------------------------- provider-dns-sync (nat-dns only, ADR 0003)
+    // Outside the VPC. Replaces the DNS Firewall provider list with the exact hosts of the configuration the router runs
+    // (inside the boundary's ceiling): synchronously from console-api at activation (with the document, before
+    // config/active.json is written) and from a deploy-time Trigger (reads config/active.json and config/baked.json).
+    if (natDns) {
+      const dnsLogs = new logs.LogGroup(this, 'ProviderDnsSyncLogs', { logGroupName: `/aws/lambda/${n('provider-dns-sync')}`,
+        retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY })
+      const dnsRole = new iam.Role(this, 'ProviderDnsSyncRole', { roleName: n('provider-dns-sync-role'), assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com', {
+        conditions: { StringEquals: { 'aws:SourceAccount': Aws.ACCOUNT_ID } } }) })
+      dnsRole.addToPolicy(new iam.PolicyStatement({ sid: 'OwnLogs', actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [`${dnsLogs.logGroupArn}:*`] }))
+      dnsRole.addToPolicy(new iam.PolicyStatement({ sid: 'ConfigRead', actions: ['s3:GetObject'],
+        resources: [CONFIG_KEYS.document, BAKED_KEY].map((k) => configBucket.arnForObjects(k)) }))
+      // ListBucket turns a missing config/active.json (no console activation yet) into 404 instead of 403.
+      dnsRole.addToPolicy(new iam.PolicyStatement({ sid: 'ConfigList', actions: ['s3:ListBucket'], resources: [configBucket.bucketArn] }))
+      dnsRole.addToPolicy(new iam.PolicyStatement({ sid: 'ProviderDomainList', actions: ['route53resolver:UpdateFirewallDomains', 'route53resolver:GetFirewallDomainList'],
+        resources: [natDns.providerList.attrArn] }))
+      const dnsInputs = createHash('sha256').update(JSON.stringify([this.baked.version, models.boundary])).digest('hex').slice(0, 16)
+      const dnsSyncFn = new lambda.DockerImageFunction(this, 'ProviderDnsSync', {
+        functionName: n('provider-dns-sync'), code: (props.lambdaCode ?? catalogLambdaCode)(this, CATALOG_LAMBDA_CMD.providerDns), architecture: lambda.Architecture.ARM_64,
+        role: dnsRole, logGroup: dnsLogs, memorySize: 256, timeout: Duration.seconds(60),
+        environment: { CONFIG_BUCKET: configBucket.bucketName, REGION: cfg.region, DOMAIN_LIST_ID: natDns.providerList.attrId,
+          PROVIDER_BOUNDARY: JSON.stringify(models.boundary), DEPLOY_INPUTS: dnsInputs },
+      })
+      // Runs when the function's version changes: a new image, a new baked document or a new boundary. After the bucket
+      // and the baked document, before the router service, so the router starts with its providers resolvable.
+      new triggers.Trigger(this, 'ProviderDnsDeploySync', {
+        handler: dnsSyncFn, invocationType: triggers.InvocationType.REQUEST_RESPONSE, timeout: Duration.minutes(2),
+        executeAfter: [configBucket, packs, dnsRole, natDns], executeBefore: [service],
+      })
+      ack(dnsRole, `AwsSolutions-IAM5[Resource::<${this.getLogicalId(dnsLogs.node.defaultChild as CfnElement)}.Arn>:*]`, 'Log streams of the function\'s own log group.')
+    }
+
     // Bucket policy (allowlists): the immutable versions, change logs, snapshots, notices and deploy inputs are written
     // and deleted by catalog-refresh only; the granted universe by catalog-grant only; the draining marker by the cleanup
     // function only; models.json and current.json by refresh, grant and console-api only (console-api's role name is
@@ -825,6 +922,14 @@ export class RouterStack extends Stack {
     const projectReason = 'Responses on bedrock-runtime authorizes InvokeModel on the default project (Bedrock User Guide, Responses API > '
       + 'Permissions); the project id is not known at synth, and bedrock:ModelArn limits the grant to this deployment\'s Responses models.'
     ack(taskRole, `AwsSolutions-IAM5[Resource::arn:aws:bedrock:${cfg.region}:<AWS::AccountId>:project/*]`, projectReason)
+    if (cfg.providerEgressMode) {
+      // ADR 0002: the console writes provider keys under <prefix>/providers/; the router reads them, through its endpoint only.
+      const keys = `AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:secretsmanager:${cfg.region}:<AWS::AccountId>:secret:${cfg.prefix}/providers/*]`
+      const keysReason = 'Console-managed provider API keys (ADR 0002): GetSecretValue on this deployment\'s provider prefix only, with aws:SourceVpce = the secretsmanager endpoint.'
+      ack(taskRole, keys, keysReason)
+      ack(boundary, keys, keysReason)
+      if (taskProviderSecrets) ack(taskProviderSecrets, keys, keysReason)
+    }
     ack(gatewayRole, `AwsSolutions-IAM5[Resource::arn:aws:execute-api:<AWS::Region>:<AWS::AccountId>:<RouterApi>/${STAGE}/*/*]`,
       'Invoke on every method and path of the one router API stage, nothing else.')
     ack(task, 'AwsSolutions-IAM5[Resource::*]', 'Execution role: ecr:GetAuthorizationToken has no resource-level permissions (CDK-generated).')

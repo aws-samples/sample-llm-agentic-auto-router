@@ -63,6 +63,7 @@ export type ErrorCode =
   | 'gateway-unavailable'     // 502: AgentCore control API error
   | 'metrics-unavailable'     // 502: CloudWatch error
   | 'delivery-failed'         // 502: writing config/active.json to S3 failed; admin.config.redeliver repeats it
+  | 'provider-dns-sync-failed' // 502: nat-dns (ADR 0003): the DNS Firewall provider list could not be updated, so nothing was activated (or delivered)
   | 'identity-delivery-failed' // 502: writing identity/blocks.json or principals.json failed; admin.identity.republish
   | 'rate-limited'            // 429
   | 'internal'                // 500
@@ -82,13 +83,16 @@ export type ErrorCode =
   | 'model-in-policy'         // 409: admin.models.unconfirm of a model the active or deploy-time configuration uses (pool model, failover, observe default, assessor model)
   | 'catalog-held'            // 409: admin.models.confirm while the catalog is held after a rollback (resume with admin.catalog.refresh resumeAfterRollback first)
   | 'rollback-invalid'        // 409: admin.catalog.rollback: the configuration in force does not validate against the target version (issues[])
+  // ---- console-managed providers (ADR 0002): admin.providers.key.*
+  | 'provider-keys-unavailable' // 503: the deployment gives the console no provider secret prefix (PROVIDER_SECRET_PREFIX), so it cannot store keys
+  | 'secrets-unavailable'     // 502: Secrets Manager refused or failed (message carries its error name, never a key)
 
 export interface ValidationIssue {
   /** JSON pointer into the submitted document ('/policy/pools/openai-chat/models/0/model'), '' for the root. */
   path: string
   /** Validator text, English, shown verbatim as "Router detail". */
   message: string
-  code?: 'schema' | 'catalog' | 'universe' | 'assessor' | 'access' | 'identity'
+  code?: 'schema' | 'catalog' | 'universe' | 'assessor' | 'access' | 'identity' | 'providers'
   /** The validator's specific code (e.g. validateAssessorSettings 'pack-version-drift'). */
   rule?: string
 }
@@ -155,7 +159,8 @@ export interface DayRange { from: string; to: string }
 // 0d-effective-config.md: per section, effective = active document ?? baked (config/baked.json). Never a guessed
 // default: when the baked document cannot be read, a baked-sourced value is 'unknown' (value absent).
 
-export type ConfigSectionName = 'policy' | 'identity' | 'assessor' | 'access'
+/** `providers` (ADR 0002) is optional in a document: absent = the deploy-time registry (providersFile), if any. */
+export type ConfigSectionName = 'policy' | 'identity' | 'assessor' | 'access' | 'providers'
 export type SettingSource = 'document' | 'baked' | 'unknown'
 /** One effective setting. `version`: the config version for 'document', the baked version ("0-baked.<sha8>") for 'baked'. */
 export interface EffectiveSetting<T> { value?: T; source: SettingSource; version?: string }
@@ -722,7 +727,73 @@ export interface ConfigDocument {
   assessor?: AssessorSettingsDoc
   identity?: { mode: IdentityMode }
   access: AccessBlock
+  /**
+   * The provider registry (ADR 0002): providers other than Bedrock and their models. Absent = the deploy-time registry
+   * (providersFile) applies; `{ providers: [] }` = none. Pools may reference its models as `<id>/<upstreamModel>`.
+   */
+  providers?: ProvidersSectionDoc
 }
+
+// ---------------------------------------------------------------------------------------------------- provider registry
+// Mirrors @auto-router/pricing ProviderDef (validateRegistry, providersIssues are the validators; this package has no
+// runtime dependencies). A section holds no secret values: `managed` keys live in Secrets Manager.
+
+export interface ProvidersSectionDoc { providers: ProviderDefDoc[] }
+
+export type ProviderSecretRef =
+  /** The key the console writes (`<prefix>/providers/<id>`, PUT /api/admin/providers/:id/key). */
+  | { managed: true }
+  /** A deployer's secret from providersFile; the console cannot add new ones. */
+  | { arn: string; field?: string }
+  /** Local runs with a loopback baseUrl only. */
+  | { env: string }
+
+export type ProviderAuthDoc =
+  | { scheme: 'none' }
+  | { scheme: 'bearer' | 'header'; header?: string; secret: ProviderSecretRef }
+
+export interface UsdPerMTokDoc { input: number; output: number; cacheRead: number; cacheWrite: Partial<Record<CacheTtl, number>> }
+
+export interface ProviderModelDoc {
+  upstreamModel: string
+  family: 'claude' | 'gpt' | 'kimi' | 'glm' | 'nova' | 'other'
+  tier: Tier
+  dialects: Dialect[]
+  contextWindow: number
+  price: UsdPerMTokDoc
+  longContext?: { aboveTokens: number; price: UsdPerMTokDoc }
+  cache: { mode: 'explicit' | 'implicit' | 'both' | 'none'; minTokens: number; ttls: CacheTtl[]; defaultTtl: CacheTtl }
+  notes?: string
+}
+
+export interface ProviderDefDoc {
+  /** ^[a-z0-9][a-z0-9-]{0,31}$, never 'bedrock'. */
+  id: string
+  /** https (http for a loopback host only); no trailing '/'. Must lie inside the deployment's egress boundary. */
+  baseUrl: string
+  paths?: Partial<Record<Dialect, string>>
+  auth: ProviderAuthDoc
+  headerTimeoutMs?: { stream?: number; nonStream?: number }
+  quirks?: { anthropicBetaDeny?: string[]; forwardOpenaiBeta?: boolean; usage?: { cacheReadTokens?: string; cacheWriteTokens?: string } }
+  models: ProviderModelDoc[]
+}
+
+/** Where a deployment lets prompts go to providers other than Bedrock (deploy-time; the network enforces it). */
+export interface EgressBoundaryView {
+  mode: 'none' | 'private' | 'firewall' | 'nat-dns' | 'bring-your-own'
+  /** Lowercase hostname patterns: exact, or `*.example.com` (not the apex). */
+  hosts: string[]
+  /** IPv4 CIDRs. */
+  cidrs: string[]
+}
+
+/**
+ * GET/PUT/DELETE /api/admin/providers/:id/key. Never the key itself: whether one is stored and when it last changed
+ * (Secrets Manager DescribeSecret; a key pending deletion counts as not set).
+ */
+export interface ProviderKeyStatus { set: boolean; updatedAt?: string }
+/** PUT /api/admin/providers/:id/key body: the key, write-only (printable, 1-4096 characters). */
+export interface ProviderKeyRequest { key: string }
 
 export interface ConfigVersionMeta {
   version: string
@@ -748,8 +819,50 @@ export interface RouterConfigState {
   issues?: string[]
 }
 
+/**
+ * GET /api/admin/providers: the provider registry in force (ADR 0002: the effective document's providers section),
+ * for display. Hosts only: no paths, auth headers or secret references. Editing goes through the config document.
+ */
+export interface ProviderRegistryView {
+  /** Registry version; absent when the deployment has no providers. */
+  version?: string
+  providers: ProviderView[]
+  /**
+   * ADR 0002: where the registry in force comes from: the active document's providers section, or the deploy-time
+   * registry (config/baked.json, else the legacy providers/active.json). Absent from older APIs.
+   */
+  source?: 'document' | 'baked'
+  /** The deployment's egress boundary (read-only; `mode: 'none'` = no providers other than Bedrock). Absent from older APIs. */
+  boundary?: EgressBoundaryView
+  /** The console can store provider keys (the deployment gave it a secret prefix). Absent from older APIs. */
+  managedKeys?: boolean
+}
+export interface ProviderView {
+  id: string
+  /** Host (and port) of the base URL. */
+  host: string
+  auth: 'none' | 'bearer' | 'header'
+  /** Union of the models' dialects. */
+  dialects: Dialect[]
+  models: ProviderModelView[]
+}
+export interface ProviderModelView {
+  /** Router model id: `<provider>/<upstreamModel>`. */
+  modelId: string
+  upstreamModel: string
+  family: string
+  tier: Tier
+  dialects: Dialect[]
+  contextWindow: number
+  /** USD per 1M tokens. */
+  price: { input: number; output: number; cacheRead: number }
+  cacheMode: 'explicit' | 'implicit' | 'both' | 'none'
+}
+
 export interface CatalogModelView {
   modelId: string; tier: Tier; dialects: Dialect[]; contextWindow: number
+  /** A provider registry model (`<provider>/<upstream model>`): its provider id. Absent = Bedrock. */
+  provider?: string
   /** List price, USD per 1M input / output tokens (catalog price.input / price.output). */
   price?: { input: number; output: number }
   /** The Bedrock service tier the router asks for on OpenAI-compatible APIs when the client sends none (absent = default). */
@@ -762,14 +875,26 @@ export interface ConfigState {
   router: RouterConfigState
   /** config/active.json delivery (S3 put); notDelivered → admin.config.redeliver. */
   delivery: Delivery
-  /** Allowed model universe (deploy parameter allowedModelUniverse). */
+  /**
+   * Models routing may use: the allowed model universe (deploy parameter allowedModelUniverse, granted Bedrock models)
+   * plus every provider registry model (deploy parameter providersFile; outside the IAM universe by design).
+   */
   universe: string[]
+  /** The catalog in force; `models` includes the registry models (with `provider`). */
   catalog: CatalogRef & { models: CatalogModelView[] }
   /**
    * Effective configuration (0d-effective-config §4): per-section sources, the settings, and the complete effective
    * document a new draft starts from (absent while a section is unknown).
    */
-  effective?: EffectiveSettings & { sources: Record<ConfigSectionName, SettingSource>; document?: ConfigDocument; bakedVersion?: string }
+  effective?: EffectiveSettings & {
+    sources: Record<ConfigSectionName, SettingSource>; document?: ConfigDocument; bakedVersion?: string
+    /**
+     * ADR 0002: the deploy-time provider registry (config/baked.json's providers, else the legacy providers/active.json),
+     * absent when the deployment has none. `document.providers` is set only when the active document has the section:
+     * a draft that leaves providers alone keeps "absent = deploy-time registry"; the Providers editor starts from this.
+     */
+    bakedProviders?: ProvidersSectionDoc
+  }
   /** Latest config line per router task (last 7 days), newest first. */
   reported?: ReportedConfig[]
   /** The model admin.config.translateRules calls (deploy parameter rulesModel); absent when translation is off. */
@@ -976,6 +1101,8 @@ export type AuditAction =
   /** admin.config.translateRules: model, cost and rule count; never the sentence. */
   | 'config.translateRules'
   | 'settings.change' | 'gateway.edit'
+  /** admin.providers.key.*: target `provider:<id>`; never the key. */
+  | 'provider.key.set' | 'provider.key.delete'
   | CatalogAuditAction
 
 /**

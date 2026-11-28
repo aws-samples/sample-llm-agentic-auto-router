@@ -1,12 +1,14 @@
 // Process entrypoint: node packages/router/src/main.ts (Node 24 type stripping). Config errors exit 1.
 import { createHash } from 'node:crypto'
 import { InMemoryStateStore, type StateStore } from '@auto-router/core'
+import { mergeRegistry } from '@auto-router/pricing'
 import { stdoutSink } from './account.ts'
 import { bedrockTransport } from './assessor.ts'
 import { createAssessorRuntime, settingsView } from './assessor-runtime.ts'
 import { catalogWatches, readBucketCatalog } from './catalog-source.ts'
 import { bucketSourceOf, ConfigError, DEFAULT_SHUTDOWN_GRACE_MS, loadConfig, packInfos, type RouterConfig } from './config.ts'
 import { createSigV4Signer } from './forward.ts'
+import { createProviderSets, secretsManagerReader } from './providers.ts'
 import { createIdentityGate, createVerifier, identityWatches, IdentityState, type IdentityGate } from './identity.ts'
 import { createRuntime } from './runtime.ts'
 import { createRouter } from './server.ts'
@@ -59,15 +61,25 @@ async function boot(): Promise<void> {
   const signer = createSigV4Signer(config.region)
   // Tier assessor (C4): the document's assessor block over ROUTER_ASSESSOR_* (default off), built from the packs
   // preloaded at boot; same signer (task role) and bedrock-runtime upstream. Config lines carry settings, packs, drift.
-  const assessors = createAssessorRuntime({ env: config.assessor, packs: config.packs ?? new Map(), catalog: config.catalog, transport: bedrockTransport(config.upstream, signer),
+  // Registry providers (11-28): arn: and managed secrets through Secrets Manager (task role, the Region's VPC endpoint),
+  // read before the router listens and refreshed every 5 min; env: secrets were checked by loadConfig. One upstream set
+  // per generation (the active document's providers section, else the baked registry), over one secret cache.
+  const providerSets = createProviderSets({ env: process.env, sink: stdoutSink, ...(config.secretPrefix !== undefined ? { secretPrefix: config.secretPrefix } : {}),
+    readSecret: secretsManagerReader({ region: config.region, signer: createSigV4Signer(config.region, undefined, 'secretsmanager') }) })
+  // The effective catalog (Bedrock ∪ registry models), as generation 0 sees it (the assessor's default catalog).
+  const assessors = createAssessorRuntime({ env: config.assessor, packs: config.packs ?? new Map(), catalog: mergeRegistry(config.catalog, config.providers), transport: bedrockTransport(config.upstream, signer),
     ...(config.assessorHoldTiers ? { holdTiers: config.assessorHoldTiers } : {}) })
   const sink = stdoutSink
   // Generation 0: the complete baked document (every section from the deploy env), version 0-baked.<sha8>. RouterStack
   // stages the same document as config/baked.json for the console (0d-effective-config.md §2).
   const sha256Hex = (t: string): string => createHash('sha256').update(t).digest('hex')
-  const baked = bakedConfigDocument({ policy: config.policy, env: process.env, packs: packInfos(config.packs ?? new Map()) }, sha256Hex)
+  // With a provider registry the baked document carries it as its providers section (version 0-baked.<sha8> covers it).
+  const baked = bakedConfigDocument({ policy: config.policy, env: process.env, packs: packInfos(config.packs ?? new Map()),
+    ...(config.providers ? { providers: config.providers } : {}) }, sha256Hex)
   const runtime = createRuntime(baked, { catalog: config.catalog, catalogSource: config.catalogSource ?? 'bundled', store, sink,
-    buildAssessor: assessors.build, lineFields: [assessors.lineFields] })
+    buildAssessor: assessors.build, lineFields: [assessors.lineFields],
+    // A providers section is checked against the deployment's boundary; only the loopback test bypass is not deployed.
+    ...(config.providerBoundary ? { boundary: config.providerBoundary } : {}), deployed: config.hopAuth.kind !== 'test-bypass', providerSets })
   if (bootNote) { const { outcome, ...rest } = bootNote; runtime.log('catalog', String(outcome), rest) }
   const watches: Watch[] = [
     // The catalog and universe first: a document may name a model only the new catalog lists.
@@ -100,13 +112,17 @@ async function boot(): Promise<void> {
     : undefined
   // Boot reads the source once before listening: the document wins over env; absent or invalid → the baked policy.
   if (poller) await poller.pollOnce()
-  const { server, shutdown } = createRouter({ config, runtime, store, signer, sink, ...(identity ? { identity } : {}) })
+  // The secrets of the generation that serves first (baked, or the active document's providers section), bounded.
+  const first = runtime.current().providers
+  if (first) await providerSets.activate(first)
+  const { server, shutdown } = createRouter({ config, runtime, store, signer, ...(first ? { providers: first } : {}), sink, ...(identity ? { identity } : {}) })
   server.listen(config.port, config.bind, () => {
     const a = server.address()
     process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), kind: 'boot', bind: config.bind,
       port: typeof a === 'object' && a ? a.port : config.port, hopAuth: config.hopAuth.kind, mode: runtime.current().policy.mode,
       policyVersion: runtime.current().policy.version, configVersion: runtime.current().configVersion, catalogVersion: runtime.current().catalog.version,
       catalogSource: runtime.current().catalogSource, universeVersion: runtime.current().universeVersion, hints: config.hints,
+      ...(runtime.current().registry ? { providers: { source: runtime.current().registrySource, ids: runtime.current().registry?.providers.map((p) => p.id) } } : {}),
       stateStore: config.stateTable !== undefined ? 'dynamodb' : 'memory',
       assessor: settingsView(runtime.current().assessor),
       identity: config.identity ? { envMode: config.identity.mode, mode: runtime.current().document.identity?.mode ?? config.identity.mode, header: config.identity.header } : { mode: 'off' } })}\n`)
@@ -118,6 +134,7 @@ async function boot(): Promise<void> {
     reporter.emit()
     reporter.start()
     poller?.start()
+    providerSets.start()
   })
   // SIGTERM (ECS stops the task): no new connections; requests in flight get ROUTER_SHUTDOWN_GRACE_MS to finish, the
   // rest are ended by the router so that each writes its log line and usage (server.ts shutdown), then exit. Idle
@@ -128,6 +145,7 @@ async function boot(): Promise<void> {
     if (stopping) return
     stopping = true
     poller?.stop()
+    providerSets.stop()
     reporter.stop()
     server.close()
     const t0 = Date.now()

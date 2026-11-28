@@ -24,6 +24,7 @@ import { HttpError, jsonBody, requireObject } from '../http.ts'
 import type { Issue } from '../local-types.ts'
 import { effectiveConfig } from '../effective.ts'
 import { activeDocument, validateDraft } from './config.ts'
+import { withCatalogInForce } from '../providers.ts'
 import type { Deps } from '../ports.ts'
 import { audit, iso, onlyKeys } from './common.ts'
 
@@ -454,7 +455,7 @@ const rollback: Handler = async (ctx) => {
     try { targetCatalog = validateCatalog(JSON.parse(text)) } catch { throw new HttpError(409, 'rollback-unavailable', `${candidate.key} is not a valid catalog`) }
     const doc = await activeDocument(deps)
     if (doc) {
-      const v = await validateDraft({ ...deps, catalog: targetCatalog }, doc)
+      const v = await validateDraft(withCatalogInForce(deps, targetCatalog), doc)
       if (!v.ok) throw new HttpError(409, 'rollback-invalid', `the configuration in force does not validate against catalog ${candidate.version}`, v.issues)
     }
     const r = await deps.objects.putIf(catalogKeys.current, json(candidate), { ifMatch: p.etag })

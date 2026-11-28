@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import type { Policy } from '@auto-router/core'
 import { Token } from 'aws-cdk-lib'
+import type { ProviderRegistry } from '@auto-router/pricing'
 import { bakedConfigDocument, canonicalJson, type BakedEnv, type PackInfo } from '@auto-router/router/settings'
 
 export const BAKED_KEY = 'config/baked.json'
@@ -48,10 +49,10 @@ function tokenPaths(v: unknown, path: string, out: string[]): string[] {
  * reads is a deploy-time token: the router hashes the resolved value at boot, the deploy would hash the token's
  * placeholder, and the two versions would differ.
  */
-export function bakedArtifact(policy: Policy, env: BakedEnv, packs: readonly PackInfo[] = manifestPacks()): BakedArtifact {
+export function bakedArtifact(policy: Policy, env: BakedEnv, packs: readonly PackInfo[] = manifestPacks(), providers?: ProviderRegistry): BakedArtifact {
   const tokens = [...BAKED_ENV_KEYS.flatMap((k) => tokenPaths(env[k], `env.${k}`, [])), ...tokenPaths(policy, 'policy', []), ...tokenPaths(packs, 'packs', [])]
   if (tokens.length) throw new Error(`baked config document: deploy-time tokens in its inputs (${tokens.join(', ')}); bake literal values only`)
-  const { seq: _seq, ...doc } = bakedConfigDocument({ policy, env, packs }, (t) => createHash('sha256').update(t).digest('hex'))
+  const { seq: _seq, ...doc } = bakedConfigDocument({ policy, env, packs, ...(providers ? { providers } : {}) }, (t) => createHash('sha256').update(t).digest('hex'))
   const json = canonicalJson(doc)
   if (/[$#]\{Token\[/.test(json) || Token.isUnresolved(json)) throw new Error('baked config document: the canonical JSON contains a deploy-time token')
   return { version: doc.version, doc, json }

@@ -32,7 +32,9 @@ export type PricedServiceTier = Exclude<ServiceTier, 'default'>
 export interface TierPrice { price: UsdPerMTok; longContext?: UsdPerMTok }
 
 export interface ModelPrice {
-  modelId: string // Bedrock model or inference profile id
+  modelId: string // Bedrock model or inference profile id; `<provider>/<upstreamModel>` for a registry model
+  /** additive: provider id (packages/pricing/src/providers.ts). Absent = 'bedrock'; required when modelId has a '/'. */
+  provider?: string
   family: 'claude' | 'gpt' | 'kimi' | 'glm' | 'nova' | 'other'
   tier: 'frontier' | 'standard' | 'fast'
   dialects: Dialect[] // APIs that reach it on bedrock-runtime

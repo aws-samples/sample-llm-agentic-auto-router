@@ -35,6 +35,7 @@ import Gateway from './admin/Gateway.tsx'
 import Health from './admin/Health.tsx'
 import Members from './admin/Members.tsx'
 import Policy from './admin/Policy.tsx'
+import Providers from './admin/Providers.tsx'
 import Versions from './admin/Versions.tsx'
 
 // The mocks run as child processes on loopback (their file lookups need a Node environment, not jsdom): the default
@@ -136,6 +137,7 @@ const cases: Array<{ name: string; Page: ComponentType; title: MessageKey; membe
   { name: 'Get started', Page: GetStarted, title: 'getStarted.title', member: true, probe: 'getStarted.step4.button' },
   { name: 'Members', Page: Members, title: 'members.title', member: false, probe: 'members.col.email' },
   { name: 'Routing policy', Page: Policy, title: 'policy.title', member: false, probe: 'policy.pools.title' },
+  { name: 'Providers', Page: Providers, title: 'providers.title', member: false, probe: 'providers.col.price' },
 ]
 
 describe.each(['en', 'zh-CN'] as Locale[])('pages in %s', (locale) => {
@@ -148,6 +150,15 @@ describe.each(['en', 'zh-CN'] as Locale[])('pages in %s', (locale) => {
       expect(screen.queryByTestId('state-error')).toBeNull()
     })
   }
+})
+
+describe('providers page', () => {
+  it('shows the registry: host and models, never the base URL path or a secret', async () => {
+    await renderPage(Providers, { locale: 'en', sub: 'u-admin', groups: ['admin'], admin: true })
+    await screen.findByText('litellm/gpt-6-luna', {}, { timeout: 8000 })
+    expect(screen.getByText('litellm.internal.example')).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/secretsmanager|\/chat\/completions|internal\.example\/v1/)
+  })
 })
 
 describe('guards', () => {

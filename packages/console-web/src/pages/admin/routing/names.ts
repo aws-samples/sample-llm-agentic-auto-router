@@ -7,6 +7,12 @@ import { baseModelId } from './model.ts'
 const title = (w: string) => (w ? (w[0] as string).toUpperCase() + w.slice(1) : w)
 
 export function modelName(id: string): string {
+  // A provider registry model `<provider>/<upstream model>`: the upstream name, then the provider.
+  const slash = id.indexOf('/')
+  if (slash > 0) {
+    const upstream = id.slice(slash + 1)
+    return `${upstream.includes('/') ? upstream : modelName(upstream)} (${id.slice(0, slash)})`
+  }
   const rest = baseModelId(id).replace(/^[a-z0-9]+\./, '').replace(/(-\d{8})?(-v\d+(:\d+)?)?$/, '')
   if (rest === '' || !/^[a-z0-9.-]+$/.test(rest)) return id.replace(/^global\./, '')
   const parts = rest.split('-')

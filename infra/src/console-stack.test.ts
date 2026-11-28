@@ -171,6 +171,33 @@ describe('console stack', () => {
     for (const t of Object.values(tables) as Res[]) expect(t.Properties?.DeletionProtectionEnabled ?? false).toBe(false)
   })
 
+  it('provider keys (ADR 0002): console-api writes, describes and deletes only <prefix>/providers/*, never reads a secret; boundary and prefix come from SSM', () => {
+    const api = policyOf(full.template, 'consoleapiRole')
+    const keys = api.filter((st) => [st.Action].flat().some((a: string) => a.startsWith('secretsmanager:')))
+    expect(keys.map((st) => st.Sid)).toEqual(['ProviderKeys'])
+    expect([keys[0]!.Action].flat().sort()).toEqual(['secretsmanager:CreateSecret', 'secretsmanager:DeleteSecret', 'secretsmanager:DescribeSecret', 'secretsmanager:PutSecretValue', 'secretsmanager:RestoreSecret', 'secretsmanager:TagResource'])
+    expect(JSON.stringify(keys[0]!.Resource)).toMatch(/:secret:llmar\/providers\/\*"/)
+    const fnEnv = Object.values(full.template.toJSON().Resources as Record<string, any>).find((r) => r.Type === 'AWS::Lambda::Function'
+      && r.Properties?.Environment?.Variables?.PROVIDER_BOUNDARY)?.Properties.Environment.Variables
+    expect(JSON.stringify(fnEnv.PROVIDER_BOUNDARY)).toContain('llmarrouterproviderboundary')
+    expect(JSON.stringify(fnEnv.PROVIDER_SECRET_PREFIX)).toContain('llmarrouterprovidersecretprefix')
+  })
+
+  it('provider-dns-sync (ADR 0003): console-api gets its name from SSM and may invoke that one function, only when the router has it', () => {
+    const t = full.template.toJSON()
+    const fnEnv = Object.values(t.Resources as Record<string, any>).find((r) => r.Type === 'AWS::Lambda::Function'
+      && r.Properties?.Environment?.Variables?.PROVIDER_DNS_SYNC_FUNCTION)?.Properties.Environment.Variables
+    expect(JSON.stringify(fnEnv.PROVIDER_DNS_SYNC_FUNCTION)).toContain('llmarrouterproviderdnssyncfunction')
+    const param = Object.entries((t.Parameters ?? {}) as Record<string, { Default?: string }>).find(([, p]) => p.Default === routerParamName('llmar', 'providerDnsSyncFunction'))?.[0]
+    expect(param).toBeDefined()
+    expect(t.Conditions?.ProviderDnsSyncEnabled).toEqual({ 'Fn::Not': [{ 'Fn::Equals': [{ Ref: param }, 'none'] }] })
+    const [, pol] = ofType(full.template, 'AWS::IAM::Policy').find(([id]) => id.startsWith('ProviderDnsSyncInvoke'))!
+    expect((pol as Res & { Condition?: string }).Condition).toBe('ProviderDnsSyncEnabled')
+    expect(pol.Properties?.PolicyDocument.Statement).toEqual([{ Sid: 'ProviderDnsSync', Effect: 'Allow', Action: 'lambda:InvokeFunction',
+      Resource: { 'Fn::Join': ['', ['arn:aws:lambda:', { Ref: 'AWS::Region' }, ':', { Ref: 'AWS::AccountId' }, ':function:', { Ref: param }]] } }])
+    expect(JSON.stringify(pol.Properties?.Roles)).toContain('consoleapiRole')
+  })
+
   it('least privilege: console-api invokes only the rules model, never updates the gateway or pool clients, never touches IAM; ingest reads only MEMBER#*/CONFIG', () => {
     // Model invocation only in the Rules* statements (rule translation, 11-10), scoped to the one rulesModel.
     const api = actions(policyOf(full.template, 'consoleapiRole').filter((s) => !s.Sid.startsWith('Rules')))

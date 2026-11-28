@@ -161,6 +161,24 @@ describe('group checks and self-scoping', () => {
 })
 
 describe('contract behaviour', () => {
+  it('providers: registry view, registry models routable in pools but not as the assessor model', async () => {
+    const t = (await signIn('ada')).access_token
+    const view = await (await api('/api/admin/providers', t)).json()
+    expect(view.providers.map((p: any) => [p.id, p.host, p.models.map((m: any) => m.modelId)])).toEqual([['litellm', 'litellm.internal.example', ['litellm/gpt-6-luna', 'litellm/claude-haiku-5-5']]])
+    expect(JSON.stringify(view)).not.toMatch(/secret|arn:|\/chat\/completions/)
+    const st = (await (await api('/api/admin/config', t)).json()) as ConfigState
+    expect(st.universe).toContain('litellm/gpt-6-luna')
+    expect(st.catalog.models.find((m) => m.modelId === 'litellm/claude-haiku-5-5')).toMatchObject({ provider: 'litellm', tier: 'fast' })
+    const post = (b: unknown) => api('/api/admin/config/validate', t, { method: 'POST', body: JSON.stringify(b) })
+    const doc = structuredClone(st.active.document) as any
+    doc.policy.pools['openai-chat'].models.push({ model: 'litellm/gpt-6-luna' })
+    expect(await (await post({ document: doc })).json()).toMatchObject({ ok: true })
+    doc.assessor = { ...doc.assessor, model: 'litellm/gpt-6-luna' }
+    const bad = await (await post({ document: doc })).json()
+    expect(bad.issues.map((i: any) => i.rule)).toContain('assessor-model-external')
+    expect((await api('/api/admin/providers', (await signIn('mia')).access_token)).status).toBe(403)
+  })
+
   it('gateway mock is router-only with auto and catch-all rules; health keeps its legacy field name', async () => {
     const t = (await signIn('ada')).access_token
     const res = await api('/api/admin/gateway', t)
@@ -346,6 +364,102 @@ describe('runs under plain Node', () => {
   })
 })
 
+describe('console-managed providers (ADR 0002)', () => {
+  const call = async (s: MockStack, path: string, init: RequestInit = {}) => {
+    const r = await fetch(s.apiUrl + path, { ...init, headers: { authorization: `Bearer ${s.mint({})}`, ...(init.body ? { 'content-type': 'application/json' } : {}) } })
+    const text = await r.text()
+    return { status: r.status, text, body: text ? JSON.parse(text) : undefined }
+  }
+  const newProvider = (baseUrl: string) => ({
+    id: 'acme', baseUrl, auth: { scheme: 'header', header: 'api-key', secret: { managed: true } },
+    models: [{ upstreamModel: 'acme-large', family: 'other', tier: 'standard', dialects: ['openai-chat'], contextWindow: 128000,
+      price: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: {} }, cache: { mode: 'none', minTokens: 0, ttls: ['5m'], defaultTtl: '5m' } }],
+  })
+
+  it('a provider and the pool that uses it activate together; the registry in force follows the document', async () => {
+    const s = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP] })
+    try {
+      const st = (await call(s, '/api/admin/config')).body as ConfigState
+      const view0 = (await call(s, '/api/admin/providers')).body
+      expect(view0).toMatchObject({ source: 'baked', managedKeys: true, boundary: { mode: 'firewall', hosts: ['*.internal.example'] } })
+      const doc = structuredClone(st.effective!.document!) as any
+      doc.providers = { providers: [...st.effective!.bakedProviders!.providers, newProvider('https://api.acme.internal.example/v1')] }
+      doc.policy.pools['openai-chat'].models.push({ model: 'acme/acme-large' })
+      const v = (await call(s, '/api/admin/config/validate', { method: 'POST', body: JSON.stringify({ document: doc }) })).body
+      expect(v).toMatchObject({ ok: true })
+      expect(v.changed).toEqual(['policy', 'providers'])
+      // The same pool reference without the provider is refused (catalog).
+      const { providers: _p, ...without } = doc
+      expect((await call(s, '/api/admin/config/validate', { method: 'POST', body: JSON.stringify({ document: without }) })).body.ok).toBe(false)
+      const a = await call(s, '/api/admin/config/activate', { method: 'POST', body: JSON.stringify({ document: doc, comment: 'add acme', baseVersion: st.active.version }) })
+      expect(a.status).toBe(200)
+      const view = (await call(s, '/api/admin/providers')).body
+      expect(view.source).toBe('document')
+      expect(view.providers.map((p: any) => p.id)).toEqual(['litellm', 'acme'])
+      const st2 = (await call(s, '/api/admin/config')).body as ConfigState
+      expect(st2.effective!.sources.providers).toBe('document')
+      expect(st2.effective!.document!.providers!.providers).toHaveLength(2)
+      expect(st2.universe).toContain('acme/acme-large')
+    } finally { await s.close() }
+  })
+
+  it('a provider outside the egress boundary is refused with a per-field path; mode none allows none', async () => {
+    const s = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP] })
+    try {
+      const st = (await call(s, '/api/admin/config')).body as ConfigState
+      const doc = { ...st.effective!.document!, providers: { providers: [newProvider('https://api.elsewhere.example')] } }
+      const r = (await call(s, '/api/admin/config/validate', { method: 'POST', body: JSON.stringify({ document: doc }) })).body
+      expect(r.ok).toBe(false)
+      expect(r.issues).toContainEqual(expect.objectContaining({ path: '/providers/providers/0/baseUrl', code: 'providers', rule: 'provider-outside-boundary' }))
+      const env = { ...doc, providers: { providers: [{ ...newProvider('https://api.acme.internal.example'), auth: { scheme: 'bearer', secret: { env: 'ACME_KEY' } } }] } }
+      const e = (await call(s, '/api/admin/config/validate', { method: 'POST', body: JSON.stringify({ document: env }) })).body
+      expect(e.issues.map((i: any) => i.path)).toContain('/providers/providers/0/auth/secret/env')
+    } finally { await s.close() }
+    const n = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP], noBoundary: true })
+    try {
+      const st = (await call(n, '/api/admin/config')).body as ConfigState
+      expect(st.effective!.bakedProviders).toBeUndefined()
+      expect((await call(n, '/api/admin/providers')).body).toMatchObject({ providers: [], boundary: { mode: 'none' } })
+      const doc = { ...st.effective!.document!, providers: { providers: [newProvider('https://api.acme.internal.example')] } }
+      const r = (await call(n, '/api/admin/config/validate', { method: 'POST', body: JSON.stringify({ document: doc }) })).body
+      expect(r.issues).toContainEqual(expect.objectContaining({ path: '/providers', rule: 'providers-not-allowed' }))
+    } finally { await n.close() }
+  })
+
+  it('keys are write-only: status only, never echoed in a response or the audit log', async () => {
+    const s = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP] })
+    const secret = 'sk-test-DO-NOT-ECHO-1234567890'
+    try {
+      const seen: string[] = []
+      const req = async (path: string, init: RequestInit = {}) => { const r = await call(s, path, init); seen.push(r.text); return r }
+      expect((await req('/api/admin/providers/acme/key')).body).toEqual({ set: false })
+      const put = await req('/api/admin/providers/acme/key', { method: 'PUT', body: JSON.stringify({ key: secret }) })
+      expect(put.status).toBe(200)
+      expect(put.body).toMatchObject({ set: true })
+      expect(Object.keys(put.body).sort()).toEqual(['set', 'updatedAt'])
+      expect((await req('/api/admin/providers/acme/key')).body).toEqual(put.body)
+      for (const bad of ['', 'x'.repeat(4097), 'line\nbreak', 'café']) {
+        expect((await req('/api/admin/providers/acme/key', { method: 'PUT', body: JSON.stringify({ key: bad }) })).status).toBe(400)
+      }
+      expect((await req('/api/admin/providers/Bad_Id/key')).status).toBe(400)
+      expect((await req('/api/admin/providers/acme/key', { method: 'DELETE' })).body).toEqual({ set: false })
+      await req('/api/admin/config')
+      await req('/api/admin/providers')
+      const day = new Date().toISOString().slice(0, 10)
+      const audit = await req(`/api/admin/audit?from=${day}&to=${day}`)
+      expect(audit.body.items.filter((e: any) => e.target === 'provider:acme').map((e: any) => e.action)).toEqual(['provider.key.delete', 'provider.key.set'])
+      for (const text of seen) expect(text).not.toContain(secret)
+    } finally { await s.close() }
+    const off = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP], noProviderKeys: true })
+    try {
+      expect((await call(off, '/api/admin/providers')).body.managedKeys).toBe(false)
+      const r = await call(off, '/api/admin/providers/acme/key', { method: 'PUT', body: JSON.stringify({ key: 'k' }) })
+      expect(r.status).toBe(503)
+      expect(r.body.error.code).toBe('provider-keys-unavailable')
+    } finally { await off.close() }
+  })
+})
+
 describe('effective configuration (0d-effective-config)', () => {
   const get = async (s: MockStack, path: string) => (await (await fetch(s.apiUrl + path, { headers: { authorization: `Bearer ${s.mint({})}` } })).json()) as never
 
@@ -353,7 +467,10 @@ describe('effective configuration (0d-effective-config)', () => {
     const s = await startMock({ apiPort: 0, idpPort: 0, appOrigins: [APP] })
     try {
       const c = (await get(s, '/api/admin/config')) as ConfigState
-      expect(c.effective!.sources).toEqual({ policy: 'document', identity: 'document', assessor: 'document', access: 'document' })
+      // ADR 0002: the active version has no providers section, so the deploy-time registry applies (bakedProviders).
+      expect(c.effective!.sources).toEqual({ policy: 'document', identity: 'document', assessor: 'document', access: 'document', providers: 'baked' })
+      expect(c.effective!.document).not.toHaveProperty('providers')
+      expect(c.effective!.bakedProviders?.providers.map((p) => p.id)).toEqual(['litellm'])
       expect(c.effective!.identityMode).toEqual({ source: 'document', version: c.active.version, value: 'observe' })
       expect(c.effective!.document?.version).toBe(c.active.version)
       expect(c.reported!.every((r) => r.matches === true)).toBe(true)

@@ -1,9 +1,12 @@
 // Request pipeline (design §2.2): inbound check -> route -> summarize/decide -> beta veto -> body hints + model
 // splice -> SigV4 forward (+ failover) -> relay -> record + log.
+// A registry model (11-28 external providers, providers.ts) goes to its provider unsigned, with the provider's auth
+// header and its upstream model name; Bedrock compatibility and profile rotation stay Bedrock-only.
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Cap, CardContext, Decision, DecisionPatch, DeferredField, Engine, RequestSummary, StateStore } from '@auto-router/core'
-import { AccessCapError, pinAllowedByCap, RETRYABLE_STATUS, tierOfPoolModel, tierWithinCap } from '@auto-router/core'
+import { AccessCapError, PinNotPortableError, pinAllowedByCap, RETRYABLE_STATUS, tierOfPoolModel, tierWithinCap } from '@auto-router/core'
+import { BEDROCK_PROVIDER, providerOf, splitModelId } from '@auto-router/pricing'
 import { ASSESSOR_GRACE_MS, type AssessorTrace, type RouterAssessor } from './assessor.ts'
 import { costBound, costFor, emit, hitRate, hopTokenOf, lineageLabel, loggedHeaders, stdoutSink, type LogSink, type RequestLog } from './account.ts'
 import { betaVeto, parseBetas, type BetaTable } from './beta.ts'
@@ -16,7 +19,8 @@ import { applyBodyHints, coreHeaders } from './hints.ts'
 import { principalKey, type IdentityGate, type IdentityMode } from './identity.ts'
 import { createInboundCheck, type InboundCheck } from './inbound.ts'
 import { allowedModels, poolTiers } from './models.ts'
-import { routeOf } from './routes.ts'
+import { createProviders, headerTimeoutMs, providerHeaders, type Providers } from './providers.ts'
+import { routeOf, upstreamUrl } from './routes.ts'
 import { createRuntime, type Generation, type RuntimeRef } from './runtime.ts'
 import { ASSESSOR_LIMITS, bakedDocument, resolveCap } from './settings.ts'
 import { errorCode, relay } from './stream.ts'
@@ -39,6 +43,11 @@ export interface RouterDeps {
   engine?: Engine
   store: StateStore
   signer: Signer
+  /**
+   * Registry provider upstreams of generations that carry none (Generation.providers: main's runtime builds one set per
+   * generation). Default: built from config.providers with process.env and no Secrets Manager reader.
+   */
+  providers?: Providers
   inbound?: InboundCheck
   sink?: LogSink
   fetchImpl?: typeof fetch
@@ -181,15 +190,20 @@ export function createRouter(deps: RouterDeps): Router {
   let upstreamAttempts = 0
   const pauseMs = config.fault.startsWith('pause-after-first-frame:') ? Number(config.fault.split(':')[1]) : 0
   const runtime: RuntimeRef = deps.runtime ?? fixedRuntime(deps, sink)
+  // Generations built without upstream sets (fixed runtime, hand-built runtimes) use these.
+  const fallbackProviders = deps.providers ?? createProviders(config.providers)
   // Every model a decision may name under any accepted configuration (I4: the IAM grant). Decisions, failover
   // targets and the EMF ServedModel bound use it; client-supplied concrete ids use the generation's pinAllowed.
-  // The deploy's base grant, extended per generation by the models granted at runtime (catalog/universe.json).
+  // The deploy's base grant, extended per generation by the models granted at runtime (catalog/universe.json) and by
+  // the registry models of its catalog (never IAM-granted: the registry itself allows them).
   const baseUniverse = config.modelUniverse ?? defaultUniverse(config, runtime.current())
-  const universes = new WeakMap<ReadonlySet<string>, ReadonlySet<string>>()
+  const universes = new WeakMap<ReadonlySet<string>, WeakMap<ReadonlySet<string>, ReadonlySet<string>>>()
   const universeOf = (g: Generation): ReadonlySet<string> => {
-    if (g.granted.size === 0) return baseUniverse
-    let u = universes.get(g.granted)
-    if (!u) { u = new Set([...baseUniverse, ...g.granted]); universes.set(g.granted, u) }
+    if (g.granted.size === 0 && g.external.size === 0) return baseUniverse
+    let byExternal = universes.get(g.granted)
+    if (!byExternal) { byExternal = new WeakMap(); universes.set(g.granted, byExternal) }
+    let u = byExternal.get(g.external)
+    if (!u) { u = new Set([...baseUniverse, ...g.granted, ...g.external]); byExternal.set(g.external, u) }
     return u
   }
   /** Identity mode of a generation: the document's identity.mode, else the env default (off without identity). */
@@ -322,6 +336,8 @@ export function createRouter(deps: RouterDeps): Router {
     if (!auth.ok) { log.reason = auth.reason; req.resume(); forbid(res); finish(403); return }
     // One generation for the whole request (I1): decide, beta veto, model checks, failover, record and the log line.
     const gen = slot.gen ?? runtime.current()
+    // The generation's provider upstreams (its document's providers section, or the baked registry).
+    const providers = gen.providers ?? fallbackProviders
     universe = universeOf(gen)
     const catalog = gen.catalog
     if (route.kind === 'models') { req.resume(); log.reason = 'models'; finish(200, modelList(gen.policy.aliases, now())); return }
@@ -431,6 +447,14 @@ export function createRouter(deps: RouterDeps): Router {
       log.decideMs = now() - tDecide // the served decision; includes the consultation only when it blocked (auto + auto)
       late = engine.settle?.(summary)
     } catch (e) {
+      if (e instanceof PinNotPortableError) {
+        // A pin to another provider's model with state that cannot cross a provider (11-28): a client error, before any
+        // upstream call. Codes only: the blocking state tags.
+        log.reason = e.code
+        log.pinNotPortable = e.tags
+        finish(400, { error: 'the conversation carries state that cannot move to the pinned model of another provider', code: e.code })
+        return
+      }
       if (e instanceof AccessCapError) {
         // Access rejection, not a router failure: return 400 with the cap code; the gateway has no fallback.
         log.reason = e.code
@@ -446,21 +470,30 @@ export function createRouter(deps: RouterDeps): Router {
 
     // 4. Beta veto (Messages only): deny list, never in observe mode, never to a lower tier.
     // Bedrock compatibility (bedrock-compat.ts): betas Bedrock rejects are dropped from the header before the veto
-    // sees them, so the veto and the upstream request use the same list.
+    // sees them, so the veto and the upstream request use the same list. A registry provider drops its own
+    // quirks.anthropicBetaDeny instead (11-28); when the veto moves to another provider's model, the header is
+    // stripped again for that provider.
     const betaHeader = typeof req.headers['anthropic-beta'] === 'string' ? req.headers['anthropic-beta'] : undefined
-    const compat = route.dialect === 'anthropic-messages' ? stripBetas(betaHeader) : { header: betaHeader, stripped: [] as string[] }
-    const sanitized: string[] = compat.stripped.map((b) => `beta:${b}`)
+    const stripFor = (model: string): { header: string | undefined; stripped: string[] } => {
+      if (route.dialect !== 'anthropic-messages') return { header: betaHeader, stripped: [] }
+      const p = providerOf(model)
+      return p === BEDROCK_PROVIDER ? stripBetas(betaHeader) : stripBetas(betaHeader, providers.get(p)?.def.quirks?.anthropicBetaDeny ?? [])
+    }
+    let compat = stripFor(decision.model)
     if (route.dialect === 'anthropic-messages') {
       const betas = parseBetas(compat.header)
       if (betas.length) {
         const current = (await store.get(summary.session.lineage))?.current
         // A veto moves up a tier, never above the caller's cap.
         const pool = poolTiers(gen.policy, catalog, route.dialect).filter((m) => tierWithinCap(cap, m.tier))
+        const before = providerOf(decision.model)
         const v = betaVeto(decision, betas, { ...(current ? { current } : {}), pool }, deps.betaTable)
         decision = v.decision
         if (v.vetoed) log.betaVeto = v.vetoed
+        if (providerOf(decision.model) !== before) compat = stripFor(decision.model)
       }
     }
+    const sanitized: string[] = compat.stripped.map((b) => `beta:${b}`)
     // Defensive: core returns pool models, allowed pins, or a hard-locked lineage's current model, which an earlier
     // generation may have chosen (I3), so the bound is the universe, not this generation's policy.
     if (!universe.has(decision.model)) {
@@ -469,16 +502,31 @@ export function createRouter(deps: RouterDeps): Router {
       return
     }
     log.decision = decisionLog(decision)
+    // The request's provider: fixed for every attempt (profile rotation stays on Bedrock; core moves a failing
+    // conversation to a sibling of any provider on its next call).
+    const providerId = providerOf(decision.model)
+    const bedrock = providerId === BEDROCK_PROVIDER
+    const ext = bedrock ? undefined : providers.get(providerId)
+    log.provider = providerId
+    if (!bedrock && !ext) {
+      // Not reachable with a valid configuration (the catalog's registry models come from the same registry).
+      log.reason = 'provider-unknown'
+      await finishSettled(502, { error: 'upstream unavailable' })
+      return
+    }
+    // External Chat streams always ask for usage (it is the only usage there is), stripped again unless the deploy
+    // chose `inject` for every client.
+    const hints = ext && route.dialect === 'openai-chat' && config.hints.chatIncludeUsage === 'off' ? { ...config.hints, chatIncludeUsage: 'inject-strip' as const } : config.hints
 
     // 5. Opt-in hints, then the model splice.
     let baseBody: Buffer
     let stripUsage = false
     try {
-      const h = applyBodyHints(route.dialect, raw, body, config.hints)
+      const h = applyBodyHints(route.dialect, raw, body, hints)
       stripUsage = h.stripUsage
       if (h.applied.length) log.hints = h.applied
       let b = h.body
-      if (route.dialect === 'anthropic-messages') {
+      if (route.dialect === 'anthropic-messages' && bedrock) {
         const m = sanitizeMetadata(b, body)
         if (m.edited) { b = m.body; sanitized.unshift('user_id') }
       }
@@ -505,7 +553,9 @@ export function createRouter(deps: RouterDeps): Router {
     // The body for one attempt's model: the model splice, then the per-model edits: Chat token limit, Chat tools
     // reasoning effort, service tier (a failover to another model gets its own body). The edits of the attempt that is
     // relayed are logged; `tier` is the service tier it asks for (priced when the response reports none).
+    // A registry model gets its upstream name and no edits (they are Bedrock compatibility).
     const bodyFor = (model: string): { body: Buffer; edits: string[]; tier?: string } => {
+      if (providerOf(model) !== BEDROCK_PROVIDER) return { body: spliceTopLevel(baseBody, 'model', JSON.stringify(splitModelId(model).upstreamModel)), edits: [] }
       const b = spliceTopLevel(baseBody, 'model', JSON.stringify(model))
       const c = route.dialect === 'openai-chat' ? chatTokenLimit(b, model, catalog) : { body: b, edits: [] }
       const r = route.dialect === 'openai-chat' ? chatToolsReasoning(c.body, model, catalog) : { body: c.body, edits: [] }
@@ -526,21 +576,36 @@ export function createRouter(deps: RouterDeps): Router {
     // 7. Forward, with one failover before any byte reaches the client.
     if (flight.cut) { await cutBeforeAnswer(); return }
     if (abort.signal.aborted) { log.clientAborted = true; log.reason = 'client-aborted'; respond(499); res.destroy(); await settleLog(); emitLog(); return }
-    const headers = upstreamHeaders(req.headers)
-    if (compat.stripped.length) {
-      if (compat.header === undefined) delete headers['anthropic-beta']
-      else headers['anthropic-beta'] = compat.header
+    let headers: Record<string, string>
+    // A registry provider whose arn: or managed secret was never read: no attempt is made (upstream-secret, recorded
+    // as a 502).
+    let noSecret = false
+    if (ext) {
+      // A secret still being read (a provider the active document just added) is waited for, within the read timeout.
+      const auth = ext.auth() ?? await ext.authSettled?.()
+      headers = { ...providerHeaders(req.headers, route.dialect, ext.def, compat.header), ...auth }
+      noSecret = auth === undefined
+    } else {
+      headers = upstreamHeaders(req.headers)
+      if (compat.stripped.length) {
+        if (compat.header === undefined) delete headers['anthropic-beta']
+        else headers['anthropic-beta'] = compat.header
+      }
     }
-    const headerMs = stream ? config.timeouts.streamHeaderMs : config.timeouts.nonStreamHeaderMs
+    // A provider may only shorten the first-byte timeout (checked at boot).
+    const headerMs = headerTimeoutMs(ext?.def, stream, config.timeouts)
     // One header deadline for ALL attempts (first try + failover): the gateway's first-byte timeout (610 s) must
     // never fire before the router answers. Cleared once the attempt we relay has its headers.
     const deadline = new AbortController()
     const deadlineTimer = setTimeout(() => deadline.abort(), headerMs)
-    const attempt = async (b: Buffer): Promise<Response | { network: string }> => {
+    const attempt = async (model: string, b: Buffer): Promise<Response | { network: string }> => {
       if (faultAt && ++upstreamAttempts === faultAt) { return new Response('{"message":"fault-inject"}', { status: 503, headers: { 'content-type': 'application/json' } }) }
       if (deadline.signal.aborted) return { network: 'timeout' }
+      if (noSecret) return { network: 'secret' }
+      const url = upstreamUrl(model, route.dialect, config.upstream, providers.get)
+      if (!url) return { network: 'network' } // not reachable: the request's provider was resolved above
       try {
-        return await forward({ upstream: config.upstream, path: route.upstreamPath, body: b, headers, signer,
+        return await forward({ url, body: b, headers, ...(bedrock ? { signer } : {}),
           signal: AbortSignal.any([abort.signal, deadline.signal]), ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) })
       } catch (e) {
         if (abort.signal.aborted) return { network: 'aborted' }
@@ -550,15 +615,16 @@ export function createRouter(deps: RouterDeps): Router {
     const tUp = now()
     log.overheadMs = tUp - tBody
     let served = decision.model
-    let up = await attempt(first.body)
+    let up = await attempt(decision.model, first.body)
     const failed = (r: Response | { network: string }) => !(r instanceof Response) || RETRYABLE_STATUS.has(r.status)
     // No profile rotation inside a Responses chain (core: failover-chain-locked).
     const chainLocked = summary.previousResponseId !== undefined || decision.point === 'hard-lock-response-chain'
     // Same-model profile retry only for policy.failover.profileRotateOn (default 429; a network error counts as 502):
     // a 5xx on global. is very likely shared by the geo profile: return it to the client; core may fail over next turn.
     const rotatable = (r: Response | { network: string }) => gen.policy.failover.profileRotateOn.includes(r instanceof Response ? r.status : 502)
-    if (failed(up) && rotatable(up) && !abort.signal.aborted && !deadline.signal.aborted && !chainLocked) {
-      const to = failoverTargets(gen.policy, route.dialect, decision.model).find((m) => universe.has(m))
+    // Profiles are a Bedrock notion: no rotation from or to a registry model (core's sibling failover covers them).
+    if (bedrock && failed(up) && rotatable(up) && !abort.signal.aborted && !deadline.signal.aborted && !chainLocked) {
+      const to = failoverTargets(gen.policy, route.dialect, decision.model).find((m) => universe.has(m) && providerOf(m) === BEDROCK_PROVIDER)
       if (to) {
         const status = up instanceof Response ? up.status : up.network
         if (up instanceof Response) await up.body?.cancel().catch(() => undefined)
@@ -570,7 +636,7 @@ export function createRouter(deps: RouterDeps): Router {
         const next = bodyFor(to) // same members as the first body: it cannot newly fail to parse
         edits = next.edits
         askedTier = next.tier
-        up = await attempt(next.body)
+        up = await attempt(to, next.body)
       }
     }
     clearTimeout(deadlineTimer) // headers arrived (or every attempt failed): the body is governed by the idle timeout
@@ -602,7 +668,9 @@ export function createRouter(deps: RouterDeps): Router {
       'x-router-reason': headerSafe(reasonCode(decision.reason)),
     })
     log.overheadMs += now() - tHead
+    const usageQuirks = ext?.def.quirks?.usage
     const r = await relay(up, res, { dialect: route.dialect, stream: stream && ctype.includes('text/event-stream'), stripUsage, now, idleMs: config.timeouts.idleMs, heartbeatMs: config.timeouts.heartbeatMs,
+      ...(usageQuirks ? { usageQuirks } : {}),
       ...(pauseMs ? { pauseAfterFirstFrameMs: pauseMs } : {}) })
     if (r.heartbeats) log.heartbeats = r.heartbeats
     // Partial calls still cost money: the usage seen so far is logged, priced and recorded.
@@ -623,7 +691,7 @@ export function createRouter(deps: RouterDeps): Router {
     else if (r.error) { log.error = r.error; log.reason = 'mid-stream'; status = 502 }
     // The relayed attempt's error code (never its message): the AWS error-type header when present, else the JSON body's.
     if (!up.ok) {
-      const header = up.headers.get('x-amzn-errortype')
+      const header = bedrock ? up.headers.get('x-amzn-errortype') : null
       const code = header ? errorCode(header) : r.errorCode
       if (code !== undefined) log.upstreamError = code
     }
@@ -702,7 +770,7 @@ function fixedRuntime(deps: RouterDeps, sink: (line: string) => void): RuntimeRe
   if (!deps.engine) throw new TypeError('createRouter: `engine` or `runtime` required')
   const engine = deps.engine
   return createRuntime(bakedDocument(config.policy), {
-    catalog: config.catalog, store: deps.store, sink, engineFor: () => engine,
+    catalog: config.catalog, ...(config.providers ? { registry: config.providers } : {}), store: deps.store, sink, engineFor: () => engine,
     buildAssessor: () => ({ ok: true, ...(deps.assessor ? { assessor: deps.assessor } : {}) }),
   })
 }
@@ -712,7 +780,8 @@ function fixedRuntime(deps: RouterDeps, sink: (line: string) => void): RuntimeRe
  * granted at runtime (Generation.granted) are added per generation.
  */
 export function defaultUniverse(config: RouterConfig, g: Generation): ReadonlySet<string> {
-  const u = new Set(allowedModels(config.policy, config.catalog))
+  // Bedrock models only: registry models are added per generation (Generation.external).
+  const u = new Set([...allowedModels(config.policy, g.catalog)].filter((m) => providerOf(m) === BEDROCK_PROVIDER))
   for (const m of g.pinAllowed) u.add(m)
   if (g.assessor) u.add(g.assessor.settings.model)
   return u

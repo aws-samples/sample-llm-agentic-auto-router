@@ -32,7 +32,7 @@ export function navItems(role: Role | undefined, t: ReturnType<typeof useI18n>['
   if (role !== 'admin') return [...usage, ...tail]
   return [
     { type: 'section-group', title: t('nav.group.usage'), items: usage },
-    { type: 'section-group', title: t('nav.group.routing'), items: [link(t('nav.policy'), '/admin/policy'), link(t('nav.models'), '/admin/models'), link(t('nav.assessor'), '/admin/assessor'), link(t('nav.gateway'), '/admin/gateway')] },
+    { type: 'section-group', title: t('nav.group.routing'), items: [link(t('nav.policy'), '/admin/policy'), link(t('nav.models'), '/admin/models'), link(t('nav.assessor'), '/admin/assessor'), link(t('nav.providers'), '/admin/providers'), link(t('nav.gateway'), '/admin/gateway')] },
     { type: 'section-group', title: t('nav.group.access'), items: [link(t('nav.members'), '/admin/members'), link(t('nav.clients'), '/admin/clients')] },
     { type: 'section-group', title: t('nav.group.operations'), items: [link(t('nav.health'), '/admin/health'), link(t('nav.audit'), '/admin/audit')] },
     ...tail,
@@ -41,7 +41,7 @@ export function navItems(role: Role | undefined, t: ReturnType<typeof useI18n>['
 
 /** The nav entry a path belongs to (detail pages highlight their list). */
 export function activeHref(pathname: string): string {
-  const roots = ['/usage', '/savings', '/decisions', '/get-started', '/settings', '/admin/policy', '/admin/config', '/admin/models', '/admin/assessor', '/admin/gateway', '/admin/members', '/admin/clients', '/admin/health', '/admin/audit']
+  const roots = ['/usage', '/savings', '/decisions', '/get-started', '/settings', '/admin/policy', '/admin/config', '/admin/models', '/admin/assessor', '/admin/providers', '/admin/gateway', '/admin/members', '/admin/clients', '/admin/health', '/admin/audit']
   if (pathname.startsWith('/sessions/')) return '/decisions'
   if (pathname.startsWith('/admin/config')) return '/admin/policy'
   return roots.find((r) => pathname === r || pathname.startsWith(`${r}/`)) ?? '/'

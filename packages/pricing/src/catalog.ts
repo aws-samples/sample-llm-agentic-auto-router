@@ -1,5 +1,6 @@
 import { CATALOGS } from './catalog.data.ts'
 import { CatalogError } from './errors.ts'
+import { providerIdProblems } from './providers.ts'
 import type { CacheTtl, Dialect, ModelPrice, PriceCatalog, PricedServiceTier, ServiceTier, UsdPerMTok } from './types.ts'
 
 // Enumerations shared with the models-file validator (meta.ts). Internal: not re-exported from index.ts.
@@ -84,6 +85,7 @@ function checkModelPrice(value: unknown, at: string, errors: string[]): void {
   }
   const m = value as unknown as ModelPrice
   if (typeof m.modelId !== 'string' || m.modelId === '') errors.push(`${at}.modelId: required`)
+  errors.push(...providerIdProblems(m, at))
   if (!FAMILIES.includes(m.family)) errors.push(`${at}.family: invalid '${String(m.family)}'`)
   if (!TIERS.includes(m.tier)) errors.push(`${at}.tier: invalid '${String(m.tier)}'`)
   if (!SCOPES.includes(m.endpointScope)) errors.push(`${at}.endpointScope: invalid '${String(m.endpointScope)}'`)

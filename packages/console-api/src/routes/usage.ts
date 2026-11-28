@@ -9,6 +9,7 @@ import type { Dialect } from '@auto-router/pricing'
 import { itemTier, savingsReport, usageReport } from '../report.ts'
 import type { Ctx } from '../app.ts'
 import type { RecordScan } from '../ports.ts'
+import { routingCatalog } from '../providers.ts'
 import { effectiveConfig } from '../effective.ts'
 import { callerRefs, dayRange, principalKeyOf } from './common.ts'
 
@@ -29,7 +30,7 @@ export async function usage(ctx: Ctx, scope: 'self' | 'admin') {
   // Self: the caller's U# items; admin: the A# items (all principals, incl. 'none').
   const items = await deps.usage.rollups(r.from, r.to, scope === 'self' ? ctx.caller.key : undefined)
   const filtered = items.filter((it) => (!f.callers || f.callers.includes(it.principal)) && (!f.models || f.models.includes(it.servedModel))
-    && (!f.tiers || f.tiers.includes(itemTier(it, deps.catalog) as Tier)) && (!f.dialects || f.dialects.includes(it.dialect as never)))
+    && (!f.tiers || f.tiers.includes(itemTier(it, routingCatalog(deps)) as Tier)) && (!f.dialects || f.dialects.includes(it.dialect as never)))
   const refs = scope === 'admin' ? await callerRefs(deps, new Set(filtered.map((it) => it.principal))) : undefined
 
   if (str(sp, 'view') === 'savings') {
@@ -42,20 +43,20 @@ export async function usage(ctx: Ctx, scope: 'self' | 'admin') {
     // The effective mode; when unknown, the data decides (projection counters exist only for observe-mode lines).
     const mode = policy.mode ?? (filtered.some((it) => Object.keys(it.counters).some((k) => k.startsWith('pn_'))) ? 'observe' : 'auto')
     return savingsReport(filtered, {
-      from: r.from, to: r.to, baseline, groupBy, mode, catalog: deps.catalog,
+      from: r.from, to: r.to, baseline, groupBy, mode, catalog: routingCatalog(deps),
       // The observe default's tier in the pool in force (an entry may override the catalog tier); tierOfPoolModel
       // reads only `pools`.
       observeDefaultTier: (d) => {
         const m = policy.observeDefaults?.[d]
-        return m ? (tierOfPoolModel({ pools: policy.pools ?? {} } as Policy, deps.catalog, d as Dialect, m) ?? '-') : '-'
+        return m ? (tierOfPoolModel({ pools: policy.pools ?? {} } as Policy, routingCatalog(deps), d as Dialect, m) ?? '-') : '-'
       },
       // Tier baselines: the model the ingest prices B at (core modelForTier, the same rule as usage-ingest savings.ts),
       // and its pool tier, so a pool without the asked tier shows as such. Unknown pools: no claim either way.
       ...((baseline === 'standard' || baseline === 'frontier') && policy.pools ? {
         baselineModel: (d: string) => {
           const p = { pools: policy.pools ?? {} } as Policy
-          const model = modelForTier(p, deps.catalog, d as Dialect, baseline)
-          const tier = model ? tierOfPoolModel(p, deps.catalog, d as Dialect, model) : undefined
+          const model = modelForTier(p, routingCatalog(deps), d as Dialect, baseline)
+          const tier = model ? tierOfPoolModel(p, routingCatalog(deps), d as Dialect, model) : undefined
           return { ...(model ? { model } : {}), ...(tier ? { tier } : {}) }
         },
       } : {}),
@@ -66,7 +67,7 @@ export async function usage(ctx: Ctx, scope: 'self' | 'admin') {
   const stackBy = (str(sp, 'stackBy') ?? 'model') as Exclude<UsageDimension, 'day'>
   if (!DIMS.includes(groupBy) || !DIMS.includes(stackBy) || stackBy === ('day' as string)) throw new HttpError(400, 'bad-request', 'groupBy / stackBy: model | tier | dialect | day | caller')
   if (scope === 'self' && (groupBy === 'caller' || stackBy === 'caller')) throw new HttpError(400, 'bad-request', 'caller dimension: admin only')
-  return usageReport(filtered, { from: r.from, to: r.to, groupBy, stackBy, catalog: deps.catalog, ...(refs ? { callers: refs } : {}) })
+  return usageReport(filtered, { from: r.from, to: r.to, groupBy, stackBy, catalog: routingCatalog(deps), ...(refs ? { callers: refs } : {}) })
 }
 
 const DAY_MS = 86_400_000

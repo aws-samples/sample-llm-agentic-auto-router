@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { fixtureCatalog, HAIKU, LUNA, OPUS, SOL, SONNET } from './__fixtures__/catalog.ts'
+import { fixtureCatalog, HAIKU, LUNA, OPUS, priceOf, SOL, SONNET } from './__fixtures__/catalog.ts'
 import {
   assistantText, assistantThinking, assistantToolUse, Conversation, EXPLORE_SYSTEM, Harness, MIN, SEC, T0, testPolicy,
   toolResult, TOOLS, userText,
@@ -114,6 +114,50 @@ describe('decide: hard locks', () => {
     expect(await run(new Harness())).toMatchObject({ action: 'switch', model: OPUS, point: 'user-turn' })
     const locked = await run(new Harness(testPolicy({ portability: { 'anthropic-thinking-signature': 'same-model' } })))
     expect(locked).toMatchObject({ action: 'retain', model: SONNET, point: 'hard-lock-state' })
+  })
+})
+
+describe('decide: families are scoped to one provider (external providers)', () => {
+  // The same Claude line served by a registry provider: a different family for non-portable state.
+  const EXT_OPUS = 'ext/claude-opus-5-5'
+  const EXT_SONNET = 'ext/claude-sonnet-5-5'
+  const external = (id: string, from: string) => ({ ...structuredClone(priceOf(from)), modelId: id, provider: 'ext', endpointScope: 'in-region' as const })
+  const catalog = { ...fixtureCatalog, version: `${fixtureCatalog.version}+r1`, models: [...fixtureCatalog.models, external(EXT_OPUS, OPUS), external(EXT_SONNET, SONNET)] }
+  const pool = (models: string[]) => testPolicy({
+    pools: {
+      'anthropic-messages': { defaultTier: 'standard', models: models.map((model) => ({ model })) },
+      'openai-chat': { defaultTier: 'standard', models: [{ model: SOL }] },
+      'openai-responses': { defaultTier: 'standard', models: [{ model: SOL }] },
+    },
+  })
+  const thinkingThenFrontier = async (hz: Harness) => {
+    const conv = new Conversation().push(userText(big(2000)))
+    const first = (await hz.cc(conv.body())).decision
+    conv.push(assistantThinking('answer'), userText('next'))
+    return { first, next: (await hz.cc(conv.body(), FRONTIER, { at: T0 + 10 * SEC })).decision }
+  }
+
+  it('a same-family model of another provider is no same-family candidate', async () => {
+    const { first, next } = await thinkingThenFrontier(new Harness(pool([EXT_OPUS, SONNET]), { catalog }))
+    expect(first.model).toBe(SONNET)
+    expect(next).toMatchObject({ action: 'retain', model: SONNET, point: 'hard-lock-state' })
+    // Control: the Bedrock Opus is a same-family candidate.
+    const control = await thinkingThenFrontier(new Harness(pool([OPUS, SONNET]), { catalog }))
+    expect(control.next).toMatchObject({ action: 'switch', model: OPUS })
+  })
+  it('with both providers in the pool, the move stays on the current provider', async () => {
+    const bedrock = await thinkingThenFrontier(new Harness(pool([EXT_OPUS, OPUS, SONNET, HAIKU]), { catalog }))
+    expect(bedrock.next).toMatchObject({ action: 'switch', model: OPUS, point: 'user-turn' })
+    const ext = await thinkingThenFrontier(new Harness(pool([EXT_OPUS, OPUS, EXT_SONNET, HAIKU]), { catalog }))
+    expect(ext.first.model).toBe(EXT_SONNET)
+    expect(ext.next).toMatchObject({ action: 'switch', model: EXT_OPUS, point: 'user-turn' })
+  })
+  it('portable conversations still move across providers', async () => {
+    const hz = new Harness(pool([EXT_OPUS, SONNET, HAIKU]), { catalog })
+    const conv = new Conversation().push(userText(big(2000)))
+    await hz.cc(conv.body())
+    conv.push(assistantText('answer'), userText('next'))
+    expect((await hz.cc(conv.body(), FRONTIER, { at: T0 + 10 * SEC })).decision).toMatchObject({ action: 'switch', model: EXT_OPUS })
   })
 })
 

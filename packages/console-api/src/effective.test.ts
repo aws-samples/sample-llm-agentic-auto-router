@@ -52,7 +52,7 @@ describe('effective settings', () => {
     const { assessor: _, ...noAssessor } = { ...baseDocument(), identity: { mode: 'require' as const } }
     expect((await activate(s, noAssessor)).status).toBe(201)
     const eff = (await call(s.handler, ev('GET', '/api/admin/config'))).body.effective
-    expect(eff.sources).toEqual({ policy: 'document', identity: 'document', assessor: 'baked', access: 'document' })
+    expect(eff.sources).toEqual({ policy: 'document', identity: 'document', assessor: 'baked', access: 'document', providers: 'baked' })
     expect(eff.identityMode).toEqual({ value: 'require', source: 'document', version: '1-20261108T120000Z' })
     expect(eff.assessorMode).toEqual({ value: 'observe', source: 'baked', version: BAKED })
     expect(eff.document.assessor).toEqual(baseDocument().assessor)

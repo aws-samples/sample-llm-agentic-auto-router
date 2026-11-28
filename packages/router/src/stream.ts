@@ -1,6 +1,6 @@
 // Response relay (design §2.1 stream.ts): bytes go to the client as they arrive; usage is read on the side.
 import type { ServerResponse } from 'node:http'
-import { createStreamUsageAccumulator, normalizeUsage, type Dialect, type NormalizedUsage } from '@auto-router/pricing'
+import { createStreamUsageAccumulator, normalizeUsage, type Dialect, type NormalizedUsage, type UsageQuirks } from '@auto-router/pricing'
 import { removeTopLevelKey } from './body.ts'
 
 export interface SseFrame { event?: string; data: string; raw: string }
@@ -155,6 +155,8 @@ export interface RelayOptions {
   heartbeatMs?: number
   /** E2E fault: after the first complete frame reaches the client, stop relaying for this long (heartbeats continue). */
   pauseAfterFirstFrameMs?: number
+  /** A registry provider's non-standard usage fields (quirks.usage). */
+  usageQuirks?: UsageQuirks
 }
 
 export class IdleTimeoutError extends Error {
@@ -186,7 +188,9 @@ export async function relay(upstream: Response, res: ServerResponse, o: RelayOpt
   const body = upstream.body
   if (!body) { res.end(); out.completed = true; return out }
   const reader = body.getReader()
-  const acc = o.stream ? createStreamUsageAccumulator(o.dialect) : undefined
+  // A registry provider's non-standard usage fields override the standard parse (stream and non-stream alike).
+  const usageOpts = o.usageQuirks ? { usage: o.usageQuirks } : undefined
+  const acc = o.stream ? createStreamUsageAccumulator(o.dialect, usageOpts) : undefined
   const framer = o.stream ? new SseFramer() : undefined
   const chunks: Uint8Array[] = []
   const tiers = o.dialect !== 'anthropic-messages'
@@ -265,7 +269,7 @@ export async function relay(upstream: Response, res: ServerResponse, o: RelayOpt
         if (tiers) { const t = serviceTierOf(json); if (t !== undefined) out.serviceTier = t }
         // Before usage: normalizeUsage may throw on an error body.
         if (!upstream.ok) out.errorCode = bodyErrorCode(json)
-        out.usage = normalizeUsage(o.dialect, json)
+        out.usage = normalizeUsage(o.dialect, json, usageOpts)
       } catch { /* error bodies carry no usage */ }
       if (!(await write(res, all))) { out.clientAborted = true; return out }
     }

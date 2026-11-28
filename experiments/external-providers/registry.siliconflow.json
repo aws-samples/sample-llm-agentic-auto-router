@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "version": "siliconflow-local-2026-11-28",
+  "providers": [
+    {
+      "id": "siliconflow",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "paths": {
+        "openai-chat": "/chat/completions",
+        "anthropic-messages": "/messages"
+      },
+      "auth": {
+        "scheme": "bearer",
+        "secret": {
+          "env": "SILICONFLOW_KEY"
+        }
+      },
+      "models": [
+        {
+          "upstreamModel": "deepseek-ai/DeepSeek-V4-Flash",
+          "family": "other",
+          "tier": "fast",
+          "dialects": [
+            "openai-chat",
+            "anthropic-messages"
+          ],
+          "contextWindow": 1000000,
+          "price": {
+            "input": 0.4225,
+            "output": 1.2676,
+            "cacheRead": 0.0423,
+            "cacheWrite": {
+              "5m": 0.4225
+            }
+          },
+          "cache": {
+            "mode": "implicit",
+            "minTokens": 64,
+            "ttls": [
+              "5m"
+            ],
+            "defaultTtl": "5m"
+          },
+          "notes": "SiliconFlow list price CNY 3.0/9.0/0.3 per MTok (peak hours; off-peak is lower) at CNY 7.1 = USD 1, 2026-11-28"
+        },
+        {
+          "upstreamModel": "deepseek-ai/DeepSeek-V4-Pro",
+          "family": "other",
+          "tier": "standard",
+          "dialects": [
+            "openai-chat",
+            "anthropic-messages"
+          ],
+          "contextWindow": 1000000,
+          "price": {
+            "input": 1.6901,
+            "output": 3.3803,
+            "cacheRead": 0.1408,
+            "cacheWrite": {
+              "5m": 1.6901
+            }
+          },
+          "cache": {
+            "mode": "implicit",
+            "minTokens": 64,
+            "ttls": [
+              "5m"
+            ],
+            "defaultTtl": "5m"
+          },
+          "notes": "SiliconFlow list price CNY 12.0/24.0/1.0 per MTok (peak hours; off-peak is lower) at CNY 7.1 = USD 1, 2026-11-28"
+        }
+      ]
+    }
+  ]
+}

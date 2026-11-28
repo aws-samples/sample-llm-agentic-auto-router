@@ -3,7 +3,7 @@
 // memory.ts.
 export { createHandler, findRoute, HANDLERS, type Ctx, type Handler, type HandlerId } from './app.ts'
 export { authorize, callerOf, parseGroups, type Caller, type MemberLookup } from './auth.ts'
-export { capIssues, changedSections, pointer, validateConfigDocument, versionNumber, versionString, type DocContext, type DocResult } from './config-doc.ts'
+export { capIssues, changedSections, mapProvidersIssue, pointer, validateConfigDocument, versionNumber, versionString, type DocContext, type DocResult } from './config-doc.ts'
 export { HttpError, MAX_BODY_BYTES, type HttpApiEvent, type HttpApiResult } from './http.ts'
 export * from './local-types.ts'
 export * from './memory.ts'
@@ -14,6 +14,7 @@ export { activeVersion, deliver, routerState, versionKey } from './routes/config
 export { BLOCKS_KEY, blocksDocument, PRINCIPALS_KEY, principalsDocument, publishIdentity } from './routes/members.ts'
 export { packKey, runningPacks } from './routes/packs.ts'
 export { decodeCursor, DynamoConsoleStore, DynamoUsageStore, encodeCursor, fromItem, toItem, type Sender } from './aws/dynamo.ts'
+export { SecretsManagerKeyStore } from './aws/secrets.ts'
 export { AgentCoreGateway, CloudWatchHealth, CognitoClientDirectory, CognitoDirectory, EcsRouterTasks, LambdaInvoker, S3ObjectStore } from './aws/services.ts'
 export { catalogRef, catalogView, withCatalog, type CatalogView } from './catalog.ts'
 export { catalogHandlers } from './routes/catalog.ts'

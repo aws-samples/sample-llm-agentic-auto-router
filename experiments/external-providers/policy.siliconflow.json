@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "version": "siliconflow-local-2026-11-28",
+  "mode": "auto",
+  "userTurn": "upgrade-only",
+  "portability": {
+    "openai-encrypted-reasoning": "strip-upgrade"
+  },
+  "pools": {
+    "openai-chat": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
+        },
+        {
+          "model": "siliconflow/deepseek-ai/DeepSeek-V4-Pro"
+        }
+      ]
+    },
+    "openai-responses": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "global.openai.gpt-6-luna",
+          "tier": "fast"
+        }
+      ]
+    },
+    "anthropic-messages": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
+        },
+        {
+          "model": "siliconflow/deepseek-ai/DeepSeek-V4-Pro"
+        }
+      ]
+    }
+  },
+  "rules": [],
+  "observeDefaults": {
+    "openai-chat": "siliconflow/deepseek-ai/DeepSeek-V4-Flash",
+    "openai-responses": "global.openai.gpt-6-luna",
+    "anthropic-messages": "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
+  }
+}

@@ -1,6 +1,7 @@
 // Config state, drafts, validate, activate with optimistic lock, delivery, roll back, redeliver (design §2.1).
 import type { SwapEffect } from '@auto-router/console-contract'
 import { describe, expect, it } from 'vitest'
+import { MemoryInvoker } from './memory.ts'
 import { ADMIN, BAKED, baseDocument, call, ev, LUNA, setup, v22, type Setup , keysLoaded } from './test-fixtures.ts'
 
 const BASE = BAKED
@@ -239,6 +240,58 @@ describe('activate', () => {
     s.objects.failPut = undefined
     expect(await call(s.handler, ev('POST', '/api/admin/config/redeliver'))).toMatchObject({ status: 200, body: { active: { n: 1 }, delivery: { state: 'delivered' } } })
     expect(s.console.audit.at(-1)?.action).toBe('config.redeliver')
+  })
+  it('nat-dns (ADR 0003): the provider list is synced with the document before anything is written; a failed sync activates nothing', async () => {
+    const s = setup()
+    const invoker = new MemoryInvoker()
+    const writesAtSync: string[][] = []
+    invoker.result = () => { writesAtSync.push([...s.objects.puts]); return { outcome: 'synced' } }
+    s.deps.invoker = invoker
+    s.deps.env.providerBoundary = { mode: 'nat-dns', hosts: ['*'], cidrs: [] }
+    s.deps.env.providerDnsSyncFunction = 'llmar-provider-dns-sync'
+    const document = { ...baseDocument(), identity: { mode: 'off' } }
+    // The sync fails: 502 provider-dns-sync-failed, no version, nothing delivered, the allow list untouched.
+    invoker.fail = (f) => f === 'llmar-provider-dns-sync'
+    const failed = await activate(s, { document, comment: 'c', baseVersion: BASE, confirmDisruptive: true })
+    expect(failed).toMatchObject({ status: 502, body: { error: { code: 'provider-dns-sync-failed' } } })
+    expect(failed.body.error.message).toMatch(/DNS Firewall provider allow list could not be updated/)
+    expect(s.console.active).toBeUndefined()
+    expect(s.objects.puts).toEqual([])
+    expect(s.logs).toContainEqual(expect.objectContaining({ kind: 'console-api-provider-dns-sync-failed', error: 'FunctionError' }))
+    // The sync works: one synchronous invoke with the document about to become active, before any write.
+    invoker.fail = undefined
+    const r = await activate(s, { document, comment: 'c', baseVersion: BASE, confirmDisruptive: true })
+    expect(r.status).toBe(201)
+    expect(invoker.calls).toEqual([{ functionName: 'llmar-provider-dns-sync', sync: true, payload: { document: expect.objectContaining({ version: '1-20261108T120000Z', identity: { mode: 'off' } }) } }])
+    expect(writesAtSync).toEqual([[]])
+    expect(s.objects.puts).toEqual(['config/versions/1.json', 'config/active.json'])
+  })
+  it('nat-dns: a failed delivery re-syncs from config/active.json; redeliver syncs the version again before writing it', async () => {
+    const s = setup()
+    const invoker = new MemoryInvoker()
+    s.deps.invoker = invoker
+    s.deps.env.providerBoundary = { mode: 'nat-dns', hosts: ['*'], cidrs: [] }
+    s.deps.env.providerDnsSyncFunction = 'llmar-provider-dns-sync'
+    s.objects.failPut = (k) => k === 'config/active.json'
+    const r = await activate(s, { document: { ...baseDocument(), identity: { mode: 'off' } }, comment: 'c', baseVersion: BASE, confirmDisruptive: true })
+    expect(r).toMatchObject({ status: 502, body: { error: { code: 'delivery-failed' } } })
+    expect(invoker.calls.map((c) => Object.keys(c.payload))).toEqual([['document'], []])
+    s.objects.failPut = undefined
+    invoker.calls = []
+    invoker.fail = () => true
+    expect(await call(s.handler, ev('POST', '/api/admin/config/redeliver'))).toMatchObject({ status: 502, body: { error: { code: 'provider-dns-sync-failed' } } })
+    expect(s.console.audit.at(-1)).toMatchObject({ action: 'config.redeliver', result: 'failed', errorCode: 'provider-dns-sync-failed' })
+    expect(s.objects.puts).not.toContain('config/active.json')
+    invoker.fail = undefined
+    expect(await call(s.handler, ev('POST', '/api/admin/config/redeliver'))).toMatchObject({ status: 200, body: { delivery: { state: 'delivered' } } })
+    expect(invoker.calls).toEqual([{ functionName: 'llmar-provider-dns-sync', sync: true, payload: { document: expect.objectContaining({ version: expect.stringMatching(/^1-/) }) } }])
+  })
+  it('other egress modes: no sync, no invoke', async () => {
+    const s = setup()
+    const invoker = new MemoryInvoker()
+    s.deps.invoker = invoker
+    expect((await activate(s, { document: { ...baseDocument(), identity: { mode: 'off' } }, comment: 'c', baseVersion: BASE, confirmDisruptive: true })).status).toBe(201)
+    expect(invoker.calls).toEqual([])
   })
   it('versions: newest first by number, paged; fetched by version string or number', async () => {
     const s = setup()

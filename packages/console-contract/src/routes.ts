@@ -97,6 +97,16 @@ export const ROUTES = [
   /** Back to pending, then the grant sync: universe first, IAM after. */
   r('admin.models.unconfirm', 'POST', '/api/admin/models/:modelId/unconfirm', 'admin', true),
   r('admin.catalog.versions', 'GET', '/api/admin/catalog/versions', 'admin'),
+  /** The provider registry in force, the egress boundary and whether keys can be stored (ADR 0002). */
+  r('admin.providers.get', 'GET', '/api/admin/providers', 'admin'),
+  /**
+   * Console-managed provider keys (ADR 0002), write-only: Secrets Manager `<prefix>/providers/<id>`. GET answers
+   * ProviderKeyStatus (DescribeSecret, never the value); PUT body ProviderKeyRequest; DELETE schedules deletion with a
+   * recovery window. The provider need not be in the active registry yet (keys are set before activation).
+   */
+  r('admin.providers.key.get', 'GET', '/api/admin/providers/:id/key', 'admin'),
+  r('admin.providers.key.put', 'PUT', '/api/admin/providers/:id/key', 'admin', true),
+  r('admin.providers.key.delete', 'DELETE', '/api/admin/providers/:id/key', 'admin', true),
   r('admin.catalog.rollback', 'POST', '/api/admin/catalog/rollback', 'admin', true),
   /** Invokes the refresh function asynchronously (mode manual). */
   r('admin.catalog.refresh', 'POST', '/api/admin/catalog/refresh', 'admin', true),

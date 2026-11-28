@@ -6,12 +6,25 @@
 // The price catalog and the granted model universe (dynamic catalog C3) are part of the generation too: a new
 // catalog version (catalog/current.json) or universe (catalog/universe.json) becomes the next generation, after the
 // active document has been re-checked against it.
+// The provider registry (11-28 external providers; console-managed since 11-28-console-providers §3) is the active
+// document's `providers` section, else the baked registry (the boot document's section, from providersFile). Every
+// generation's catalog is the effective one, mergeRegistry(<Bedrock catalog>, registry), version
+// `<catalog>+<version of the document that supplied the registry>`, so policies, pins, the engine, the assessor and
+// accounting see the registry models; a new Bedrock catalog is merged with the generation's registry before it is
+// checked. A section is checked against the deployment's egress boundary (providersIssues): an invalid one rejects the
+// whole document, like any other invalid configuration, and the line carries the code `providers-invalid` only (the
+// issue texts name hosts; they stay in the ApplyResult). With `providerSets`, each generation has its own upstream set
+// over one shared secret cache; a set becoming active reads its new secrets at once.
 import { checkPolicyAgainstCatalog, createEngine, failoverOtherModel, type Engine, type EngineOptions, type Policy, type StateStore } from '@auto-router/core'
-import { validateCatalog, validateUniverse, type PriceCatalog } from '@auto-router/pricing'
+import { BEDROCK_PROVIDER, mergeRegistry, validateCatalog, validateUniverse, type EgressBoundary, type PriceCatalog, type ProviderRegistry } from '@auto-router/pricing'
 import type { LogSink } from './account.ts'
 import type { RouterAssessor } from './assessor.ts'
 import { allowedModels } from './models.ts'
-import { SECTIONS, validateConfigDocument, validatePrincipals, type ConfigDocument, type IdentityMode, type Principals, type Section, type SectionSource } from './settings.ts'
+import type { ProviderSets, Providers } from './providers.ts'
+import {
+  documentRegistry, registryArns, SECTIONS, validateConfigDocument, validatePrincipals,
+  type ConfigDocument, type IdentityMode, type Principals, type ProvidersContext, type Section, type SectionSource,
+} from './settings.ts'
 
 /**
  * Where the generation's catalog came from: the config bucket (catalog/current.json), the catalog bundled for the
@@ -34,8 +47,27 @@ export interface Generation {
   readonly principals: Principals
   /** Per section: from the active document, or the baked (deploy-time) value (0d-effective-config.md §1). */
   readonly sources: Readonly<Record<Section, SectionSource>>
-  /** The price catalog of this generation: costs, pool tiers, chat token limits, pins, the engine and the assessor. */
+  /**
+   * The price catalog of this generation: costs, pool tiers, chat token limits, pins, the engine and the assessor.
+   * With a provider registry, the effective catalog (version `<bedrock catalog>+<registry>`).
+   */
   readonly catalog: PriceCatalog
+  /** The Bedrock catalog `catalog` was built from (equal to it without a registry). */
+  readonly baseCatalog: PriceCatalog
+  /**
+   * The provider registry merged into `catalog` (absent: Bedrock only): the document's providers section (version =
+   * the document's version), or the baked one.
+   */
+  readonly registry?: ProviderRegistry
+  /** Where `registry` came from: the active document's providers section, or the baked registry. */
+  readonly registrySource: SectionSource
+  /** The upstreams of `registry` (RuntimeOptions.providerSets); absent: the server's fallback set. */
+  readonly providers?: Providers
+  /**
+   * Registry model ids of `catalog`. They are outside the IAM model universe (which covers Bedrock models only) and
+   * allowed by the registry itself: they extend the router's decision bound like `granted` does.
+   */
+  readonly external: ReadonlySet<string>
   readonly catalogSource: CatalogSource
   /** Etag of catalog/universe.json, or 'none' before one was read (or while it is absent). */
   readonly universeVersion: string
@@ -53,8 +85,19 @@ export interface Generation {
 export type AssessorBuilder = (doc: ConfigDocument, catalog: PriceCatalog) => { ok: true; assessor?: RouterAssessor; warnings?: string[] } | { ok: false; issues: string[] }
 
 export interface RuntimeOptions {
-  /** Generation 0's catalog. */
+  /** Generation 0's Bedrock catalog (merged with the baked registry). */
   catalog: PriceCatalog
+  /**
+   * The baked provider registry when the boot document has no providers section (hand-built runtimes and tests). A
+   * boot document's section wins: main boots from bakedConfigDocument, which carries the registry, version 0-baked.<sha8>.
+   */
+  registry?: ProviderRegistry
+  /** ROUTER_PROVIDER_BOUNDARY (validated). Default: mode none (no providers section may name a provider). */
+  boundary?: EgressBoundary
+  /** Not the loopback test bypass: a providers section may hold no env secrets and only the baked registry's ARNs. Default true. */
+  deployed?: boolean
+  /** Upstream sets per generation over one shared secret cache (main). Absent: generations carry no upstreams. */
+  providerSets?: Pick<ProviderSets, 'create' | 'activate'>
   /** Default 'bundled'. */
   catalogSource?: CatalogSource
   store: StateStore
@@ -110,9 +153,23 @@ function unknownGroups(g: Generation): string[] {
 }
 
 /** Codes of a catalog rejection (logged; the messages stay in the ApplyResult). */
-export type CatalogRejectCode = 'catalog-json' | 'catalog-invalid' | 'catalog-region' | 'document-invalid' | 'assessor-invalid' | 'engine-failed'
+export type CatalogRejectCode = 'catalog-json' | 'catalog-invalid' | 'catalog-region' | 'document-invalid' | 'assessor-invalid' | 'engine-failed' | 'providers-invalid'
 
-interface CatalogState { catalog: PriceCatalog; source: CatalogSource; universeVersion: string; universeIds: ReadonlySet<string> }
+/** The line form of document issues: a providers section's issues (they name hosts) become the code `providers-invalid`. */
+export function issueCodes(issues: readonly string[]): string[] {
+  const out: string[] = []
+  for (const i of issues) {
+    const v = /^providers(\.|\[|:)/.test(i) ? 'providers-invalid' : i
+    if (!out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+/** `catalog` is the effective one, `base` the Bedrock catalog it was merged from. */
+interface CatalogState { catalog: PriceCatalog; base: PriceCatalog; source: CatalogSource; universeVersion: string; universeIds: ReadonlySet<string> }
+
+const externalIn = (catalog: PriceCatalog): ReadonlySet<string> =>
+  new Set(catalog.models.filter((m) => (m.provider ?? BEDROCK_PROVIDER) !== BEDROCK_PROVIDER).map((m) => m.modelId))
 
 const grantedIn = (ids: ReadonlySet<string>, catalog: PriceCatalog): ReadonlySet<string> => {
   const known = new Set(catalog.models.map((m) => m.modelId))
@@ -127,7 +184,14 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
     createEngine({ policy, catalog, store: opts.store, ...a?.engineOptions, ...opts.engineOptions }))
 
   type Built = { gen: Generation; warnings?: string[] } | { issues: string[]; code: CatalogRejectCode }
-  const build = (doc: ConfigDocument, principals: Principals, principalsVersion: string, sources: Generation['sources'], cat: CatalogState): Built => {
+  /** The registry of a generation: which one, where from, and its upstreams (reused while the registry is the same). */
+  interface RegistryState { registry: ProviderRegistry | undefined; source: SectionSource; providers?: Providers }
+  const build = (doc: ConfigDocument, principals: Principals, principalsVersion: string, sources: Generation['sources'], cat: CatalogState, reg: RegistryState): Built => {
+    let providers = reg.providers
+    if (!providers && opts.providerSets) {
+      // Throws on an env secret that is not set (a loopback section of a local run).
+      try { providers = opts.providerSets.create(reg.registry) } catch (e) { return { issues: [`providers: ${(e as Error).message}`], code: 'providers-invalid' } }
+    }
     let a: ReturnType<AssessorBuilder>
     try { a = opts.buildAssessor(doc, cat.catalog) } catch (e) { return { issues: [`assessor: ${(e as Error).message}`], code: 'assessor-invalid' } }
     if (!a.ok) return { issues: a.issues, code: 'assessor-invalid' }
@@ -139,19 +203,35 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
       configVersion: doc.version, seq: doc.seq, principalsVersion, document: doc, policy: doc.policy, engine,
       ...(a.assessor ? { assessor: a.assessor } : {}),
       pinAllowed, aliases: new Set(Object.keys(doc.policy.aliases)), principals, sources,
-      catalog: cat.catalog, catalogSource: cat.source, universeVersion: cat.universeVersion, granted,
+      catalog: cat.catalog, baseCatalog: cat.base, ...(reg.registry ? { registry: reg.registry } : {}), registrySource: reg.source,
+      ...(providers ? { providers } : {}), external: externalIn(cat.catalog),
+      catalogSource: cat.source, universeVersion: cat.universeVersion, granted,
     }
     return { gen, ...(a.warnings?.length ? { warnings: a.warnings } : {}) }
   }
-  const catOf = (g: Generation): CatalogState => ({ catalog: g.catalog, source: g.catalogSource, universeVersion: g.universeVersion, universeIds })
+  const catOf = (g: Generation): CatalogState => ({ catalog: g.catalog, base: g.baseCatalog, source: g.catalogSource, universeVersion: g.universeVersion, universeIds })
+  const regOf = (g: Generation): RegistryState => ({ registry: g.registry, source: g.registrySource, ...(g.providers ? { providers: g.providers } : {}) })
+  /** The effective catalog of a Bedrock catalog under the current generation's registry (throws CatalogError on a clash). */
+  const effectiveOf = (base: PriceCatalog): PriceCatalog => mergeRegistry(base, gen.registry)
+
+  // The baked registry: the boot document's providers section (version = the boot document's), else opts.registry.
+  const bakedRegistry = documentRegistry(boot, opts.registry)
+  const providersCtx: ProvidersContext = {
+    boundary: opts.boundary ?? { mode: 'none', hosts: [], cidrs: [] }, deployed: opts.deployed ?? true,
+    allowedArns: registryArns(bakedRegistry), ...(bakedRegistry ? { baked: bakedRegistry } : {}),
+  }
+  const validate = (value: unknown, base: PriceCatalog) => validateConfigDocument(value, base, { unknownPolicyKeys: 'warn', providers: providersCtx })
 
   let universeIds: ReadonlySet<string> = new Set()
   const allBaked = Object.fromEntries(SECTIONS.map((k) => [k, 'baked'])) as Record<Section, SectionSource>
-  const first = build(boot, new Map(), 'none', allBaked, { catalog: opts.catalog, source: opts.catalogSource ?? 'bundled', universeVersion: 'none', universeIds })
+  const first = build(boot, new Map(), 'none', allBaked,
+    { catalog: mergeRegistry(opts.catalog, bakedRegistry), base: opts.catalog, source: opts.catalogSource ?? 'bundled', universeVersion: 'none', universeIds },
+    { registry: bakedRegistry, source: 'baked' })
   if ('issues' in first) throw new Error(`boot configuration ${boot.version} rejected:\n  - ${first.issues.join('\n  - ')}`)
   let gen = first.gen
+  if (gen.providers) void opts.providerSets?.activate(gen.providers)
   /** The last catalog rejected because of the active document (retried after a document change). */
-  let pendingCatalog: { catalog: PriceCatalog; source: CatalogSource } | undefined
+  let pendingCatalog: { catalog: PriceCatalog; source: CatalogSource } | undefined // the Bedrock catalog
   /** The last document rejected by validation (retried, when it then validates, after a catalog change). */
   let pendingDocument: unknown
 
@@ -165,23 +245,27 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
       ts: new Date(now()).toISOString(), kind: 'config', source, outcome,
       configVersion: g.configVersion, principalsVersion: g.principalsVersion, policyVersion: g.policy.version, mode: g.policy.mode,
       catalogVersion: g.catalog.version, catalogSource: g.catalogSource, universeVersion: g.universeVersion,
-      effective, sources: g.sources, ...fields, ...extra,
+      effective, sources: g.sources,
+      // Ids only (never baseUrls or secrets); absent without any registry.
+      ...(g.registry ? { providers: { source: g.registrySource, ids: g.registry.providers.map((p) => p.id) } } : {}),
+      ...fields, ...extra,
     }))
   }
 
   /** The current generation rebuilt over another catalog: the active document is re-checked against it first. */
   const rebuildWith = (cat: CatalogState): Built => {
     try { checkPolicyAgainstCatalog(gen.policy, cat.catalog) } catch (e) { return { issues: [`policy: ${(e as Error).message}`], code: 'document-invalid' } }
-    return build(gen.document, gen.principals, gen.principalsVersion, gen.sources, cat)
+    return build(gen.document, gen.principals, gen.principalsVersion, gen.sources, cat, regOf(gen))
   }
 
   const applyDocument = (raw: unknown): ApplyResult => {
     const p = parse(raw)
-    const checked = p.ok ? validateConfigDocument(p.value, gen.catalog, { unknownPolicyKeys: 'warn' }) : p
+    const checked = p.ok ? validate(p.value, gen.baseCatalog) : p
     if (!checked.ok) {
       if (p.ok) pendingDocument = p.value
       const issues = clip(checked.issues)
-      line(gen, 'config', 'rejected', { ...(issues ? { issues } : {}) })
+      const codes = clip(issueCodes(checked.issues))
+      line(gen, 'config', 'rejected', { ...(codes ? { issues: codes } : {}) })
       return { outcome: 'rejected', ...(issues ? { issues } : {}) }
     }
     const doc = checked.value
@@ -192,16 +276,28 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
     }
     const raw0 = (p.ok ? p.value : {}) as Record<string, unknown>
     const sources = Object.fromEntries(SECTIONS.map((k) => [k, raw0[k] !== undefined ? 'document' : 'baked'])) as Record<Section, SectionSource>
-    const b = build(doc, gen.principals, gen.principalsVersion, sources, catOf(gen))
+    // The document's registry: the same object as now (baked, both times) keeps the generation's catalog and upstreams.
+    const registry = documentRegistry(doc, bakedRegistry)
+    const reg: RegistryState = registry === gen.registry ? regOf(gen) : { registry, source: doc.providers ? 'document' : 'baked' }
+    let b: Built
+    try {
+      b = build(doc, gen.principals, gen.principalsVersion, sources, registry === gen.registry ? catOf(gen) : { ...catOf(gen), catalog: mergeRegistry(gen.baseCatalog, registry) }, reg)
+    } catch (e) {
+      b = { issues: [`providers: ${(e as Error).message}`], code: 'providers-invalid' } // not reached: validate merged the same registry
+    }
     if ('issues' in b) {
       pendingDocument = p.ok ? p.value : undefined
       const issues = clip(b.issues)
-      line(gen, 'config', 'rejected', { attempted: doc.version, ...(issues ? { issues } : {}) })
+      const codes = clip(issueCodes(b.issues))
+      line(gen, 'config', 'rejected', { attempted: doc.version, ...(codes ? { issues: codes } : {}) })
       return { outcome: 'rejected', ...(issues ? { issues } : {}) }
     }
     const from = gen.configVersion
+    const before = gen.providers
     gen = b.gen
     pendingDocument = undefined
+    // A new upstream set serves from now on: its secrets new to the cache are read at once (requests wait for them).
+    if (gen.providers && gen.providers !== before) void opts.providerSets?.activate(gen.providers)
     // 11-10 C1: another model in a failover list is refused by the console but only warned about here, so a document
     // activated before that check keeps working. Code and position only (dialect/index).
     const otherModel = failoverOtherModel(gen.policy).map((f) => `failover-other-model:${f.dialect}/${f.index}`)
@@ -219,8 +315,10 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
   }
 
   const applyCatalogValue = (catalog: PriceCatalog, source: CatalogSource): ApplyResult => {
-    if (catalog.version === gen.catalog.version && source === gen.catalogSource) return { outcome: 'ignored' }
-    const b = rebuildWith({ catalog, source, universeVersion: gen.universeVersion, universeIds })
+    if (catalog.version === gen.baseCatalog.version && source === gen.catalogSource) return { outcome: 'ignored' }
+    let effective: PriceCatalog
+    try { effective = effectiveOf(catalog) } catch (e) { return rejectCatalog('catalog-invalid', [(e as Error).message], catalog.version) }
+    const b = rebuildWith({ catalog: effective, base: catalog, source, universeVersion: gen.universeVersion, universeIds })
     if ('issues' in b) {
       // Kept only when the active document is what blocks it (a later document may accept it).
       pendingCatalog = b.code === 'document-invalid' || b.code === 'assessor-invalid' ? { catalog, source } : undefined
@@ -231,7 +329,7 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
     pendingCatalog = undefined
     line(gen, 'catalog', 'applied', { from, granted: gen.granted.size, ...(b.warnings?.length ? { warnings: clip(b.warnings) } : {}) })
     // A document the previous catalog refused, applied now if this catalog accepts it.
-    if (pendingDocument !== undefined && validateConfigDocument(pendingDocument, gen.catalog, { unknownPolicyKeys: 'warn' }).ok) {
+    if (pendingDocument !== undefined && validate(pendingDocument, gen.baseCatalog).ok) {
       const d = pendingDocument
       pendingDocument = undefined
       applyDocument(d)
@@ -260,7 +358,7 @@ export function createRuntime(boot: ConfigDocument, opts: RuntimeOptions): Runti
       line(gen, 'principals', 'applied', { principals: checked.value.size, ...(skipped ? { skipped } : {}), ...(codes.length ? { issues: codes } : {}) })
       return { outcome: 'applied' }
     },
-    expectCatalog(version) {
+    expectCatalog(version) { // a Bedrock catalog version (catalog/current.json)
       if (pendingCatalog && pendingCatalog.catalog.version !== version) pendingCatalog = undefined
     },
     applyCatalog(raw, source = 'bucket') {

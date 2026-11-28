@@ -41,3 +41,6 @@ experiments/console-e2e/results/
 
 # Presentation decks (local only)
 /docs/deck/
+
+# External-provider live test: ledger and run outcomes (name the account indirectly via costs; keep local)
+experiments/external-providers/results/

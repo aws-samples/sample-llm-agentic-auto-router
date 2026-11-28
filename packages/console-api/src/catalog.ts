@@ -6,6 +6,7 @@
 // and versions only.
 import { catalogKeys, validateCatalog, validatePointer, validateUniverse, type CatalogPointer, type PriceCatalog } from '@auto-router/pricing'
 import { HttpError } from './http.ts'
+import { resolveRouting } from './providers.ts'
 import type { BaseDeps, CatalogInfo, Deps } from './ports.ts'
 
 export interface CatalogView extends CatalogInfo {
@@ -121,7 +122,7 @@ export async function withCatalog(base: BaseDeps): Promise<Deps> {
   const v = await catalogView(base)
   if (v) {
     const { catalog, universe, ...info } = v
-    return { ...base, catalog, catalogInfo: info, env: { ...base.env, modelUniverse: universe } }
+    return { ...base, catalog, catalogInfo: info, routing: await resolveRouting(base, catalog), env: { ...base.env, modelUniverse: universe } }
   }
   const d = { ...base } as Deps
   Object.defineProperty(d, 'catalog', {

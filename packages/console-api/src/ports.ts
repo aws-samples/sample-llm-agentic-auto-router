@@ -1,7 +1,7 @@
 // Injected storage and AWS ports (no SDK imports here). The AWS adapters implement them; memory.ts implements them
 // with in-memory maps for tests and local development. Handlers see only these interfaces. Item layouts follow
 // a3 §3 and 17's usage-ingest (records.ts): handlers read the stored fields, never table keys.
-import type { CatalogPointer, PriceCatalog } from '@auto-router/pricing'
+import type { CatalogPointer, EgressBoundary, PriceCatalog, ProviderRegistry } from '@auto-router/pricing'
 import type { AuditEntry, Budget, Cap, DeploymentSettings, GatewayInfo, HealthRange, HealthReport, Page, Role, SwapEffect } from '@auto-router/console-contract'
 import type { PriceCatalog as Catalog } from '@auto-router/pricing'
 import type { ConfigDocument, Delivery, StoredVersion } from './local-types.ts'
@@ -179,7 +179,11 @@ export interface ObjectStore {
 }
 
 /** Asynchronous Lambda invoke (InvocationType Event) of the catalog refresh and grant functions. */
-export interface FunctionInvoker { invokeAsync(functionName: string, payload: Record<string, unknown>): Promise<void> }
+export interface FunctionInvoker {
+  invokeAsync(functionName: string, payload: Record<string, unknown>): Promise<void>
+  /** RequestResponse invoke: the function's result; rejects when the invoke or the function failed (FunctionError). */
+  invokeSync(functionName: string, payload: Record<string, unknown>): Promise<unknown>
+}
 
 export interface DirectoryUser {
   username: string
@@ -248,6 +252,18 @@ export interface DeploymentEnv {
   /** Dynamic catalog (C2b): the refresh and grant function names; the admin.models/catalog routes answer 503 without them. */
   catalogRefreshFunction?: string
   catalogGrantFunction?: string
+  /**
+   * ADR 0002: the deployment's egress boundary (PROVIDER_BOUNDARY). Absent = `{ mode: 'none' }`: no provider other than
+   * Bedrock may be added in the console.
+   */
+  providerBoundary?: EgressBoundary
+  /** The provider secret prefix (PROVIDER_SECRET_PREFIX): managed keys are `<prefix>/providers/<id>`. Absent: keys cannot be stored. */
+  providerSecretPrefix?: string
+  /**
+   * nat-dns (ADR 0003): the provider-dns-sync function (PROVIDER_DNS_SYNC_FUNCTION; 'none' = absent). Invoked
+   * synchronously with the document before config/active.json is written; its failure fails the activation.
+   */
+  providerDnsSyncFunction?: string
 }
 
 /** What the request's catalog came from (dynamic catalog C3; set per request by createHandler). */
@@ -260,6 +276,19 @@ export interface CatalogInfo {
   granted: readonly string[]
   /** Etag of catalog/universe.json, 'none' when absent. */
   universeVersion: string
+}
+
+/**
+ * Console-managed provider keys in Secrets Manager (ADR 0002). Write-only: no method returns a secret value, and
+ * adapters never log one.
+ */
+export interface ProviderKeyStore {
+  /** DescribeSecret: undefined when the secret is absent or scheduled for deletion. */
+  status(name: string): Promise<{ updatedAt?: string } | undefined>
+  /** PutSecretValue, or CreateSecret with `tags` when absent (a secret scheduled for deletion is restored first). */
+  put(name: string, value: string, tags: Readonly<Record<string, string>>): Promise<void>
+  /** DeleteSecret with a recovery window; a no-op when absent or already scheduled. */
+  delete(name: string, recoveryDays: number): Promise<void>
 }
 
 /** Overrides core policySwapEffects (tests); absent = core's. */
@@ -281,8 +310,15 @@ export interface Deps {
   catalog: PriceCatalog
   /** Set by createHandler with `catalog`; absent on hand-built deps (tests): bundled, no granted models. */
   catalogInfo?: CatalogInfo
-  /** Invokes the catalog refresh and grant functions; absent: those routes answer 503. */
+  /**
+   * External providers (set by createHandler with `catalog`): the catalog routing sees (`catalog` plus the registry
+   * models, as the router merges it) and the registry it came from. Absent: no providers (providers.ts routingCatalog).
+   */
+  routing?: RoutingCatalog
+  /** Invokes the catalog refresh and grant functions and provider-dns-sync; absent: those routes answer 503. */
   invoker?: FunctionInvoker
+  /** Provider keys (ADR 0002); absent (no PROVIDER_SECRET_PREFIX): the key routes answer 503 provider-keys-unavailable. */
+  providerKeys?: ProviderKeyStore
   /**
    * Universe in `env.modelUniverse` is effective per request: the deploy's grant plus granted models (catalogInfo.base
    * is the deploy's alone).
@@ -301,4 +337,19 @@ export interface Deps {
  * Deps as the Lambda builds them: `catalog` is the Region's bundled catalog, absent in a Region without one (the
  * bucket's current catalog is then the only one).
  */
-export type BaseDeps = Omit<Deps, 'catalog' | 'catalogInfo'> & { catalog?: PriceCatalog }
+export type BaseDeps = Omit<Deps, 'catalog' | 'catalogInfo' | 'routing'> & { catalog?: PriceCatalog }
+
+export interface RoutingCatalog {
+  catalog: PriceCatalog
+  /** The registry in force (ADR 0002: the active document's providers section, else the deploy-time registry); undefined = none. */
+  registry?: ProviderRegistry
+  /** Router ids of the registry models merged into `catalog` (empty when the merge failed). */
+  registryModels: readonly string[]
+  /** Where `registry` comes from: the active document's section, or the deploy (absent = 'baked'). */
+  source?: 'document' | 'baked'
+  /**
+   * The deploy-time registry (config/baked.json's providers, else the legacy providers/active.json): what a document
+   * without a providers section runs, and whose secret ARNs a document may keep. Undefined = none.
+   */
+  baked?: ProviderRegistry
+}

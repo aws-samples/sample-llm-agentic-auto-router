@@ -31,3 +31,13 @@ describe('admin assessor rule fields (task 11-18)', () => {
     expectTypeOf<T['assessorRules']>().toEqualTypeOf<import('./index.ts').TranslatedAssessorRule[] | undefined>()
   })
 })
+
+describe('console-managed providers (ADR 0002)', () => {
+  it('the providers section is optional, and the key status never carries a key', () => {
+    type D = import('./index.ts').ConfigDocument
+    expectTypeOf<D['providers']>().toEqualTypeOf<import('./index.ts').ProvidersSectionDoc | undefined>()
+    expectTypeOf<import('./index.ts').ProviderKeyStatus>().toEqualTypeOf<{ set: boolean; updatedAt?: string }>()
+    expectTypeOf<'provider.key.set' | 'provider.key.delete'>().toExtend<AuditAction>()
+    expectTypeOf<'providers'>().toExtend<import('./index.ts').ConfigSectionName>()
+  })
+})

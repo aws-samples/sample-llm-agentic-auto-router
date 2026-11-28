@@ -1,4 +1,5 @@
-// Upstream call to bedrock-runtime (design §2.1 forward.ts): SigV4 (service bedrock, signed payload) + fetch.
+// Upstream call (design §2.1 forward.ts): bedrock-runtime with SigV4 (service bedrock, signed payload), or a registry
+// provider (providers.ts) unsigned, with its own auth header already in `headers`.
 import { createHash, createHmac, type Hash, type Hmac } from 'node:crypto'
 import { defaultProvider } from '@aws-sdk/credential-provider-node'
 import { HttpRequest } from '@smithy/protocol-http'
@@ -30,7 +31,7 @@ class NodeSha256 {
 }
 
 /** Task-role credentials through the default provider chain (ECS container endpoint in the task), with refresh. */
-export function createSigV4Signer(region: string, credentials = defaultProvider(), service: 'bedrock' | 's3' | 'dynamodb' = 'bedrock'): Signer {
+export function createSigV4Signer(region: string, credentials = defaultProvider(), service: 'bedrock' | 's3' | 'dynamodb' | 'secretsmanager' = 'bedrock'): Signer {
   // S3 signs the path as is (no double URI escaping); its payload hash travels in x-amz-content-sha256.
   const sig = new SignatureV4({ service, region, credentials, sha256: NodeSha256, ...(service === 's3' ? { uriEscapePath: false } : {}) })
   return {
@@ -58,22 +59,21 @@ export function upstreamHeaders(client: Record<string, string | string[] | undef
 }
 
 export interface ForwardOptions {
-  upstream: URL
-  path: string
+  url: URL
   body: Buffer
   headers: Record<string, string>
-  signer: Signer
+  /** SigV4 signer (Bedrock). Absent: the request is sent unsigned with `headers` as given (registry providers). */
+  signer?: Signer
   signal: AbortSignal
   fetchImpl?: typeof fetch
 }
 
-/** Signs and sends one attempt. Rejects on network errors; the caller decides about failover. */
+/** Signs (when a signer is given) and sends one attempt. Rejects on network errors; the caller decides about failover. */
 export async function forward(o: ForwardOptions): Promise<Response> {
-  const url = new URL(o.path, o.upstream)
-  const signed = await o.signer.sign({ method: 'POST', url, headers: o.headers, body: o.body })
+  const signed = o.signer ? await o.signer.sign({ method: 'POST', url: o.url, headers: o.headers, body: o.body }) : o.headers
   const headers: Record<string, string> = {}
   for (const [k, v] of Object.entries(signed)) if (k.toLowerCase() !== 'host') headers[k] = v
-  return (o.fetchImpl ?? fetch)(url, { method: 'POST', headers, body: o.body, signal: o.signal, redirect: 'manual' })
+  return (o.fetchImpl ?? fetch)(o.url, { method: 'POST', headers, body: o.body, signal: o.signal, redirect: 'manual' })
 }
 
 /**
@@ -83,7 +83,7 @@ export async function forward(o: ForwardOptions): Promise<Response> {
 export function createBedrockPost(upstream: URL, signer: Signer, fetchImpl: typeof fetch = fetch) {
   return async (path: string, body: string, extraHeaders: Record<string, string>, signal?: AbortSignal): Promise<{ status: number; body: string }> => {
     const res = await forward({
-      upstream, path, body: Buffer.from(body, 'utf8'), headers: { ...upstreamHeaders({}), ...extraHeaders }, signer,
+      url: new URL(path, upstream), body: Buffer.from(body, 'utf8'), headers: { ...upstreamHeaders({}), ...extraHeaders }, signer,
       signal: signal ?? AbortSignal.timeout(10_000), fetchImpl,
     })
     return { status: res.status, body: await res.text() }

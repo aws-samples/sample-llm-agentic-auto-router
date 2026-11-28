@@ -72,7 +72,8 @@ function Editor({ cfg, packs }: { cfg: ConfigState; packs: PacksResponse }) {
   // The console fills packVersion from the running image's manifest (validateAssessorSettings checks drift).
   const next = { ...from, assessor: (s.mode === 'off' ? s : { ...s, packVersion: pack?.packVersion }) as AssessorSettingsDoc }
   const stats = packs.stats
-  const models = cfg.catalog.models.filter((m) => m.dialects.includes('openai-chat') || m.dialects.includes('anthropic-messages')).map((m) => ({ value: m.modelId, label: m.modelId }))
+  // The assessor runs on Bedrock models only (provider registry models are refused: assessor-model-external).
+  const models = cfg.catalog.models.filter((m) => !m.provider && (m.dialects.includes('openai-chat') || m.dialects.includes('anthropic-messages'))).map((m) => ({ value: m.modelId, label: m.modelId }))
   return (
     <ContentLayout header={<Header variant="h1" description={t('assessor.description')} actions={
       <Button variant="primary" disabled={!dirty} onClick={() => { validate.mutate({ document: next }); setActivating(true) }}>{t('config.activate')}</Button>

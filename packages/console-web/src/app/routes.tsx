@@ -42,6 +42,7 @@ export const routes: RouteObject[] = [
         { path: 'admin/models', element: admin(page(() => import('../pages/admin/Models.tsx'))) },
         { path: 'admin/assessor', element: admin(page(() => import('../pages/admin/Assessor.tsx'))) },
         { path: 'admin/gateway', element: admin(page(() => import('../pages/admin/Gateway.tsx'))) },
+        { path: 'admin/providers', element: admin(page(() => import('../pages/admin/Providers.tsx'))) },
         { path: 'admin/health', element: admin(page(() => import('../pages/admin/Health.tsx'))) },
         { path: 'admin/audit', element: admin(page(() => import('../pages/admin/Audit.tsx'))) },
         { path: '*', element: <NotFound /> },

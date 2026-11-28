@@ -1,20 +1,32 @@
 // Console-side validation of a config document (design v1 §2.1). The router's own validateConfigDocument
 // (@auto-router/router/settings: schema, policy + catalog, assessor with the running image's packs, identity, access
-// groups) decides validity; the console adds what only it can check: every model inside the IAM model universe and
-// every allowed pin a model the policy serves. Its string issues are mapped to the contract's ValidationIssue
-// (JSON-pointer path, category, rule). The router re-validates on activation and keeps the last good config.
+// groups) decides validity; the console adds what only it can check: every model inside the IAM model universe, every
+// allowed pin a model the policy serves. The providers section (ADR 0002) goes through the router's validator with
+// the deployment's ProvidersContext (egress boundary, deployed rules, the deploy-time registry). Its string issues are
+// mapped to the contract's ValidationIssue (JSON-pointer path, category, rule). The router re-validates on activation
+// and keeps the last good config.
 import { failoverOtherModel, type Policy } from '@auto-router/core'
-import type { ModelPrice, PriceCatalog } from '@auto-router/pricing'
+import { mergeRegistry, validateRegistry, type EgressBoundary, type ModelPrice, type PriceCatalog, type ProviderRegistry, type ProvidersSection } from '@auto-router/pricing'
 import { allowedModels } from '@auto-router/router'
-import { validateConfigDocument as routerValidate, type PackInfo } from '@auto-router/router/settings'
+import { documentRegistry as routerDocumentRegistry, registryArns, validateConfigDocument as routerValidate, type PackInfo, type ProvidersContext } from '@auto-router/router/settings'
 import { CONFIG_SECTIONS, type ConfigDocument, type Issue } from './local-types.ts'
+import { registryModelsOf, sectionRegistry } from './providers.ts'
 
 export interface DocContext {
+  /** The catalog in force (Bedrock models only: the document's registry is merged here). */
   catalog: PriceCatalog
   /** Packs of the image the router runs (router config reports, else the console's packs/current.json). */
   packs: readonly PackInfo[]
   /** Models the task role may invoke (allowedModelUniverse). */
   universe: ReadonlySet<string>
+  /**
+   * The deploy-time provider registry: what the document runs without a providers section, and whose secret ARNs a
+   * section may keep. Its models (and a section's) may be used by routing outside the universe (the router allows a
+   * generation's registry models), not by the assessor (v1 is Bedrock-only).
+   */
+  bakedRegistry?: ProviderRegistry
+  /** The deployment's egress boundary (absent: mode none). */
+  boundary?: EgressBoundary
   /** The assessor has an adapter for the model (router `hasAssessorAdapter`). */
   hasAdapter: (price: ModelPrice) => boolean
 }
@@ -38,6 +50,7 @@ export function mapIssue(s: string): Issue {
   const i = s.indexOf(': ')
   const head = i < 0 ? s : s.slice(0, i)
   const rest = i < 0 ? s : s.slice(i + 2)
+  if (/^providers($|[.[])/.test(head)) return mapProvidersIssue(s)
   const [section = '', ...tail] = head.split('.')
   if (section === 'assessor') {
     const j = rest.indexOf(': ')
@@ -55,27 +68,93 @@ export function mapIssue(s: string): Issue {
   return { path: pointer(head), message: rest, code: SECTION_CODE[section] ?? 'schema', rule: SECTION_RULE[section] ?? (head === 'schemaVersion' ? 'schema-version' : 'unexpected-key') }
 }
 
+/**
+ * A pricing providersIssues line → ValidationIssue under /providers. Forms: `providers: <m>`, `providers.<k>: <m>`,
+ * `providers[i] (<id>).<field>[j] (<name>).<field>: <m>` (labels in parentheses are skipped).
+ */
+export function mapProvidersIssue(s: string): Issue {
+  const segs: Array<string | number> = ['providers']
+  let rest = s.slice('providers'.length)
+  let ok = s.startsWith('providers')
+  if (ok && rest.startsWith('.')) {
+    // `providers.<key>` (an unknown field, or `providers.providers` from the registry schema).
+    const m = /^\.([A-Za-z0-9_]+)/.exec(rest)
+    if (m) { segs.push(m[1] as string); rest = rest.slice(m[0].length) }
+  }
+  if (ok && rest.startsWith('[')) segs.push('providers')
+  while (ok && !rest.startsWith(': ') && rest !== '') {
+    let m = /^\[(\d+)\]/.exec(rest)
+    if (m) {
+      segs.push(Number(m[1])); rest = rest.slice(m[0].length)
+      const label = /^ \(.*?\)(?=[.:\[]|$)/.exec(rest)
+      if (label) rest = rest.slice(label[0].length)
+      continue
+    }
+    m = /^\.([A-Za-z0-9_-]+)/.exec(rest)
+    if (m) { segs.push(m[1] as string); rest = rest.slice(m[0].length); continue }
+    ok = false
+  }
+  const i = s.indexOf(': ')
+  const message = i < 0 ? s : s.slice(i + 2)
+  const path = ok ? pointer(...segs) : pointer('providers')
+  const rule = /egress boundary|address ranges|port 443|IPv6/.test(message) ? 'provider-outside-boundary'
+    : /allows no providers/.test(message) ? 'providers-not-allowed'
+    : /already in the catalog|already carries/.test(message) ? 'providers-merge'
+    : /env secrets are for local runs|not a secret this deployment granted/.test(message) ? 'provider-secret-not-allowed'
+    : /unknown field|unknown key/.test(message) ? 'unexpected-key'
+    : 'providers-invalid'
+  return { path, message, code: 'providers', rule }
+}
+
+/** The section's registry for merging when its schema is valid (boundary issues aside), else undefined. */
+function draftRegistry(section: unknown, version: string): ProviderRegistry | undefined {
+  if (typeof section !== 'object' || section === null || !Array.isArray((section as ProvidersSection).providers)) return undefined
+  try {
+    return sectionRegistry({ providers: validateRegistry({ schemaVersion: 1, version, providers: (section as ProvidersSection).providers }).providers }, version)
+  } catch { return undefined }
+}
+
 /** `assessor.<field>: <code>: <message>` warnings (pack drift and the like) as ValidationIssue. */
 const mapWarning = (s: string): Issue => mapIssue(s)
 
 export function validateConfigDocument(raw: unknown, ctx: DocContext): DocResult {
   if (!isObj(raw)) return { ok: false, issues: [{ path: '', message: 'config document: object required', code: 'schema', rule: 'object-required' }], warnings: [] }
+  // The providers section (ADR 0002) is checked by the router's own validator with the deployment's context (boundary,
+  // deployed rules, the deploy-time registry and its ARNs), so the console and the router agree; the policy and the
+  // assessor are checked against the catalog merged with the document's registry (its section, else the deploy-time one).
+  const section = raw.providers
+  const baked = ctx.bakedRegistry
+  const providers: ProvidersContext = {
+    boundary: ctx.boundary ?? { mode: 'none', hosts: [], cidrs: [] }, deployed: true, allowedArns: registryArns(baked), ...(baked ? { baked } : {}),
+  }
   const r = routerValidate({ ...raw, version: DRAFT_VERSION }, ctx.catalog, {
     assessor: {
       catalog: ctx.catalog, packs: ctx.packs, hasAdapter: ctx.hasAdapter, invokableModels: ctx.universe, invokableLabel: 'the allowed model universe',
       // The console keeps the block activatable: drift and stale fields of an off block are errors here.
       packVersionMismatch: 'error', offImageChecks: 'error',
     },
+    providers,
   })
-  const issues: Issue[] = r.ok ? [] : r.issues.map(mapIssue)
+  let issues: Issue[] = r.ok ? [] : r.issues.map(mapIssue)
+  // The registry the document runs (for the console-only checks): as validated, else the section when its schema is valid.
+  const registry = r.ok ? routerDocumentRegistry(r.value, baked) : section !== undefined ? draftRegistry(section, DRAFT_VERSION) : baked
+  let catalog = ctx.catalog
+  try { catalog = mergeRegistry(ctx.catalog, registry) } catch { /* reported by the router validator */ }
+  const registryIds = new Set(catalog === ctx.catalog ? [] : registryModelsOf(registry))
+  const assessorModel = isObj(raw.assessor) ? raw.assessor.model : undefined
+  if (typeof assessorModel === 'string' && registryIds.has(assessorModel)) {
+    // One issue instead of the router's not-invokable / no-adapter pair.
+    issues = issues.filter((i) => i.path !== pointer('assessor', 'model'))
+    issues.push({ path: pointer('assessor', 'model'), message: `${assessorModel} is a provider registry model; the assessor runs on Bedrock models only`, code: 'assessor', rule: 'assessor-model-external' })
+  }
   const warnings: Issue[] = (r.ok ? r.warnings ?? [] : []).map(mapWarning)
   const policy = r.ok ? r.value.policy : undefined
 
   // Console-only checks (they need the deploy parameter and the validated policy).
   if (policy) {
-    const served = allowedModels(policy, ctx.catalog)
+    const served = allowedModels(policy, catalog)
     for (const m of served) {
-      if (!ctx.universe.has(m)) issues.push({ path: pointer('policy'), message: `model ${m} is outside the allowed model universe (widening it is a CDK deploy: allowedModelUniverse)`, code: 'universe', rule: 'model-outside-universe' })
+      if (!ctx.universe.has(m) && !registryIds.has(m)) issues.push({ path: pointer('policy'), message: `model ${m} is outside the allowed model universe (widening it is a CDK deploy: allowedModelUniverse)`, code: 'universe', rule: 'model-outside-universe' })
     }
     // 11-10 C1: failover holds other entry points of the same model; another model there is refused here (the router
     // only warns, so documents activated before this check keep working).
@@ -96,8 +175,8 @@ export function validateConfigDocument(raw: unknown, ctx: DocContext): DocResult
   if (issues.length > 0 || !r.ok || !policy) return { ok: false, issues, warnings }
   const { seq: _, ...value } = r.value as typeof r.value & { seq?: number }
   const document = { ...(value as unknown as ConfigDocument), version: typeof raw.version === 'string' ? raw.version : '' }
-  // Keep the policy as submitted (the router normalizes defaults into its validated copy).
-  return { ok: true, document: { ...document, policy: raw.policy as Record<string, unknown> }, policy, warnings }
+  // Keep the policy (and the providers section) as submitted (the router normalizes defaults into its validated copy).
+  return { ok: true, document: { ...document, policy: raw.policy as Record<string, unknown>, ...(section !== undefined ? { providers: section as ConfigDocument['providers'] } : {}) }, policy, warnings }
 }
 
 /** A tier cap `{ maxTier?, allowPins? }` for member and client limits (same rules as the router's validateCap). */

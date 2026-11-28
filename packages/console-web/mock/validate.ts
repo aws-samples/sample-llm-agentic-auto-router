@@ -5,10 +5,11 @@
 // plus the document checks those modules make (version form, identity mode, group caps, assessor block). When C3/C4
 // merge, `routerValidator` replaces it and the interim code goes.
 
-import type { ConfigDocument, GroupName, SwapEffect, Tier, ValidationIssue } from '@auto-router/console-contract'
+import type { ConfigDocument, EgressBoundaryView, GroupName, SwapEffect, Tier, ValidationIssue } from '@auto-router/console-contract'
 import { checkPolicyAgainstCatalog, failoverOtherModel, PolicyError, validatePolicy, type Policy } from '@auto-router/core'
 import type { PriceCatalog } from '@auto-router/pricing'
 import { validateCustomRules } from '@auto-router/assessor/custom'
+import { providerIssues } from './providers.ts'
 
 export interface DocumentValidator {
   validate(doc: unknown): ValidationIssue[]
@@ -19,6 +20,11 @@ export interface ValidationContext {
   catalog: PriceCatalog
   universe: readonly string[]
   packs: ReadonlyArray<{ name: string; packVersion: string; autoCapable: boolean }>
+  /**
+   * ADR 0002: a document's providers section is checked against the deployment's egress boundary (console-api:
+   * providersIssues, deployed). `catalog` and `universe` already hold the registry models that apply to the document.
+   */
+  providers?: { boundary: EgressBoundaryView; allowedArns: readonly string[] }
 }
 
 const TIERS: readonly Tier[] = ['fast', 'standard', 'frontier']
@@ -32,7 +38,8 @@ export function interimValidator(ctx: ValidationContext): DocumentValidator {
       const issues: ValidationIssue[] = []
       const add = (path: string, message: string, code: ValidationIssue['code'], rule?: string) => issues.push(rule ? { path, message, code, rule } : { path, message, code })
       if (!isObj(doc)) return [{ path: '', message: 'document: object required', code: 'schema' }]
-      for (const k of Object.keys(doc)) if (!['schemaVersion', 'version', 'policy', 'assessor', 'identity', 'access'].includes(k)) add(`/${k}`, `${k}: unknown field`, 'schema')
+      for (const k of Object.keys(doc)) if (!['schemaVersion', 'version', 'policy', 'assessor', 'identity', 'access', 'providers'].includes(k)) add(`/${k}`, `${k}: unknown field`, 'schema')
+      if (doc.providers !== undefined && ctx.providers) issues.push(...providerIssues(doc.providers, ctx.providers.boundary, ctx.providers.allowedArns))
       if (doc.schemaVersion !== 1) add('/schemaVersion', 'schemaVersion: 1 required', 'schema')
       if (typeof doc.version !== 'string' || !VERSION.test(doc.version)) add('/version', `version: "<n>-<suffix>" required, got ${JSON.stringify(doc.version)?.slice(0, 80)}`, 'schema')
       let policy: Policy | undefined
@@ -76,7 +83,9 @@ export function interimValidator(ctx: ValidationContext): DocumentValidator {
           if (pack && typeof a.packVersion === 'string' && a.packVersion !== pack.packVersion) {
             add('/assessor/packVersion', `pack ${pack.name} is ${pack.packVersion} in the running image, the settings were saved for ${a.packVersion}`, 'assessor', 'pack-version-drift')
           }
-          if (present('model') && !ctx.catalog.models.some((m) => m.modelId === a.model)) add('/assessor/model', `model '${String(a.model)}' is not in the ${ctx.catalog.region} catalog`, 'assessor', 'model-not-in-catalog')
+          const am = present('model') ? ctx.catalog.models.find((m) => m.modelId === a.model) : undefined
+          if (present('model') && !am) add('/assessor/model', `model '${String(a.model)}' is not in the ${ctx.catalog.region} catalog`, 'assessor', 'model-not-in-catalog')
+          if (am?.provider) add('/assessor/model', `${am.modelId} is a provider registry model; the assessor runs on Bedrock models only`, 'assessor', 'assessor-model-external')
           if (present('threshold') && (typeof a.threshold !== 'number' || a.threshold < 0 || a.threshold > 1)) add('/assessor/threshold', 'threshold: number in [0, 1]', 'assessor', 'threshold-invalid')
           if (present('timeoutMs') && (typeof a.timeoutMs !== 'number' || !Number.isInteger(a.timeoutMs) || a.timeoutMs < 100 || a.timeoutMs > 30_000)) add('/assessor/timeoutMs', 'timeoutMs: integer 100..30000', 'assessor', 'timeout-invalid')
           if (present('autoRules') && a.autoRules !== 'pack' && a.autoRules !== 'all') add('/assessor/autoRules', "autoRules: 'pack' | 'all'", 'assessor', 'auto-rules-invalid')
@@ -96,7 +105,7 @@ export function interimValidator(ctx: ValidationContext): DocumentValidator {
   }
 }
 
-const TOP = ['policy', 'assessor', 'identity', 'access'] as const
+const TOP = ['policy', 'assessor', 'identity', 'access', 'providers'] as const
 
 export function changedSections(prev: ConfigDocument, next: ConfigDocument): string[] {
   return TOP.filter((k) => JSON.stringify(prev[k]) !== JSON.stringify(next[k]))

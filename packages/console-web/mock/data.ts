@@ -3,6 +3,7 @@
 // Record shapes follow the router log line (packages/router/src/account.ts) with the design v1 §2.2 additions.
 
 import type {
+  EgressBoundaryView,
   ActiveAssessorSettings, Delivery, AuditEntry, Baseline, Budget, CallerRef, Cap, ConfigDocument, ConfigVersionMeta, Dialect, GatewayInfo, Member, PackEntry,
   IdentityKeysReason, IdentityKeysState, PacksResponse, PrincipalEntry, PrincipalKey, RecordDetail, RouterConfigState, ServiceClient, Tier,
 } from '@auto-router/console-contract'
@@ -22,6 +23,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { buildCatalogMock, type CatalogMock, type CatalogScenario } from './catalog.ts'
 import { MOCK_ACCOUNTS } from './idp.ts'
+import { DEMO_BOUNDARY, DEMO_PROVIDERS } from './providers.ts'
 
 export const REGION = 'ap-southeast-1'
 export const PREFIX = 'llmar'
@@ -96,6 +98,12 @@ export interface MockDb {
   gateway: GatewayInfo
   /** Dynamic catalog (admin.models.*, admin.catalog.*); `universe` above is its deploy-time base grant. */
   catalogMock: CatalogMock
+  /** The deployment's egress boundary (ADR 0002; PROVIDER_BOUNDARY): read-only in the console. */
+  boundary: EgressBoundaryView
+  /** PROVIDER_SECRET_PREFIX; absent = the console cannot store provider keys (503 provider-keys-unavailable). */
+  secretPrefix?: string
+  /** Secrets Manager `<prefix>/providers/<id>`: held here, never returned by any route. */
+  providerKeys: Map<string, { value: string; updatedAt: string }>
 }
 
 /** Models of the live v11 document (src/pages/admin/routing/fixtures.ts). */
@@ -166,7 +174,8 @@ export function canonicalJson(v: unknown): string {
 /** The baked document: deploy-time policy, identity observe, assessor observe, no caps; version 0-baked.<sha8>. */
 export function bakedDocument(packVersion: string): ConfigDocument {
   const base = configDocument('observe', 'tmp', packVersion)
-  const doc: ConfigDocument = { ...base, access: { groups: {} } }
+  // The deploy-time registry (-c providersFile) is the baked document's providers section (ADR 0002).
+  const doc: ConfigDocument = { ...base, access: { groups: {} }, providers: structuredClone(DEMO_PROVIDERS) }
   const { version: _v, ...rest } = doc
   const version = `0-baked.${createHash('sha256').update(canonicalJson(rest)).digest('hex').slice(0, 8)}`
   return { ...doc, version, policy: { ...doc.policy, version: `policy-${version}` } }
@@ -458,7 +467,7 @@ export function buildDb(now: number = Date.now(), effectiveMode: EffectiveMode =
     configDelivery: { state: 'delivered', at: iso(v2At + 2_000) }, identityDelivery: { state: 'delivered', at: iso(now - 3600_000) }, identityKeys: KEY_STATES.loaded,
     baked, bakedReadable: effectiveMode !== 'unknown', reportedMismatch: false,
     router: { status: 'active', reportedVersion: versions.at(-1)!.version, since: iso(v2At + 25_000) },
-    universe, rulesTranslator: { model: 'global.openai.gpt-6.1-sol' }, packs, audit, settings: { retentionDays: 90, defaultBaseline: DEFAULT_BASELINE }, defaultBudget: { monthlyUsd: 200, alertAt: 0.8, hardStop: false }, gateway,
+    universe, boundary: DEMO_BOUNDARY, secretPrefix: PREFIX, providerKeys: new Map(), rulesTranslator: { model: 'global.openai.gpt-6.1-sol' }, packs, audit, settings: { retentionDays: 90, defaultBaseline: DEFAULT_BASELINE }, defaultBudget: { monthlyUsd: 200, alertAt: 0.8, hardStop: false }, gateway,
   }
 }
 

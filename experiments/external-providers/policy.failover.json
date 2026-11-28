@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "version": "ext-failover-2026-11-28",
+  "mode": "auto",
+  "userTurn": "upgrade-only",
+  "portability": {
+    "openai-encrypted-reasoning": "strip-upgrade"
+  },
+  "pools": {
+    "openai-chat": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "down/gpt-6-luna"
+        },
+        {
+          "model": "global.openai.gpt-6-luna",
+          "tier": "fast"
+        }
+      ]
+    },
+    "openai-responses": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "litellm/gpt-6-luna"
+        },
+        {
+          "model": "global.openai.gpt-6-luna",
+          "tier": "fast"
+        }
+      ]
+    },
+    "anthropic-messages": {
+      "defaultTier": "fast",
+      "models": [
+        {
+          "model": "down/claude-haiku-5-5"
+        },
+        {
+          "model": "global.anthropic.claude-haiku-5-5"
+        }
+      ]
+    }
+  },
+  "rules": [],
+  "observeDefaults": {
+    "openai-chat": "global.openai.gpt-6-luna",
+    "openai-responses": "global.openai.gpt-6-luna",
+    "anthropic-messages": "global.anthropic.claude-haiku-5-5"
+  }
+}

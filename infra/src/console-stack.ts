@@ -10,7 +10,7 @@
 //   1. consoleBundle=false, ingest=false: the API, tables and an empty site bucket. Run the anonymous-denial checks.
 //   2. consoleBundle=true: upload the SPA. 3. ingest=true: the subscription filter, so usage data starts flowing.
 import {
-  Aws, type CfnElement, CfnOutput, CustomResource, Duration, Fn, IgnoreMode, RemovalPolicy, Stack, type StackProps, Validations,
+  Aws, CfnCondition, type CfnElement, CfnOutput, CustomResource, Duration, Fn, IgnoreMode, RemovalPolicy, Stack, type StackProps, Validations,
   aws_apigatewayv2 as apigw, aws_apigatewayv2_authorizers as authorizers, aws_apigatewayv2_integrations as integrations,
   aws_cloudfront as cloudfront, aws_cloudfront_origins as origins, aws_cloudwatch as cw, aws_cognito as cognito,
   aws_dynamodb as ddb, aws_ecr_assets as ecrAssets, aws_iam as iam, aws_lambda as lambda,
@@ -18,7 +18,7 @@ import {
   aws_s3_deployment as s3deploy, aws_sqs as sqs, aws_ssm as ssm, custom_resources as cr,
 } from 'aws-cdk-lib'
 import type { Construct } from 'constructs'
-import { catalogKeys as CATALOG_KEYS } from '@auto-router/pricing'
+import { catalogKeys as CATALOG_KEYS, providerKeys } from '@auto-router/pricing'
 import { BAKED_OBJECTS } from './baked.ts'
 import { invokeStatements, metadataCatalog } from './models.ts'
 import { contextReader, REGION_RE, resolveCommon, SettingsError, type CommonSettings, type Ctx } from './settings.ts'
@@ -37,6 +37,8 @@ export const ROUTER_PARAMS = {
   clusterName: 'cluster-name', serviceName: 'service-name', serviceArn: 'service-arn', cliClientId: 'cli-client-id', agentClientId: 'agent-client-id',
   callbackPorts: 'cli-callback-ports', codexOauthPort: 'codex-oauth-port', modelUniverse: 'model-universe', identityHeader: 'identity-header',
   catalogRefreshFunction: 'catalog-refresh-function', catalogGrantFunction: 'catalog-grant-function',
+  providerBoundary: 'provider-boundary', providerSecretPrefix: 'provider-secret-prefix',
+  providerDnsSyncFunction: 'provider-dns-sync-function',
 } as const
 export type RouterParam = keyof typeof ROUTER_PARAMS
 export const routerParamName = (prefix: string, p: RouterParam): string => `/${prefix}/router/${ROUTER_PARAMS[p]}`
@@ -243,6 +245,8 @@ export class ConsoleStack extends Stack {
     apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'CatalogWrite', actions: ['s3:GetObject', 's3:PutObject'],
       resources: [CATALOG_KEYS.models, CATALOG_KEYS.current].map(objectArn) }))
     apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'CatalogRead', actions: ['s3:GetObject'], resources: [objectArn('catalog/*')] }))
+    // The deploy's provider registry (design 11-28 P3), read only; every router deploy writes it.
+    apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'ProvidersRead', actions: ['s3:GetObject'], resources: [objectArn(providerKeys.active)] }))
     const catalogFns = { refresh: param('catalogRefreshFunction'), grant: param('catalogGrantFunction') }
     apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'CatalogFunctions', actions: ['lambda:InvokeFunction'],
       resources: [catalogFns.refresh, catalogFns.grant].map((f) => `arn:aws:lambda:${Aws.REGION}:${Aws.ACCOUNT_ID}:function:${f}`) }))
@@ -282,7 +286,27 @@ export class ConsoleStack extends Stack {
       METRICS_NAMESPACE: 'LlmAutoRouter', REFRESH_DAYS: '30', RECORD_RETENTION_DAYS: String(cfg.recordRetentionDays),
       CONSOLE_RULES_MODEL: cfg.rulesModel ?? 'none',
       CATALOG_REFRESH_FUNCTION: catalogFns.refresh, CATALOG_GRANT_FUNCTION: catalogFns.grant,
+      // Console-managed providers (ADR 0002): the deploy's egress boundary, and the secret prefix ('none' = keys off).
+      PROVIDER_BOUNDARY: param('providerBoundary'), PROVIDER_SECRET_PREFIX: param('providerSecretPrefix'),
+      // nat-dns (ADR 0003): invoked synchronously at activation, before config/active.json is written ('none' = off).
+      PROVIDER_DNS_SYNC_FUNCTION: param('providerDnsSyncFunction'),
     } })
+    // Only when the router deploy has the function (nat-dns): the parameter is resolved at deploy, so a condition
+    // decides, and the grant names that one function.
+    const dnsSync = param('providerDnsSyncFunction')
+    const hasDnsSync = new CfnCondition(this, 'ProviderDnsSyncEnabled', { expression: Fn.conditionNot(Fn.conditionEquals(dnsSync, 'none')) })
+    const dnsSyncInvoke = new iam.Policy(this, 'ProviderDnsSyncInvoke', { roles: [apiRole], statements: [new iam.PolicyStatement({ sid: 'ProviderDnsSync',
+      actions: ['lambda:InvokeFunction'], resources: [`arn:aws:lambda:${Aws.REGION}:${Aws.ACCOUNT_ID}:function:${dnsSync}`] })] })
+    const dnsSyncInvokeCfn = dnsSyncInvoke.node.defaultChild as iam.CfnPolicy
+    dnsSyncInvokeCfn.cfnOptions.condition = hasDnsSync
+    // Console-managed providers (ADR 0002): at activation, the document's providers section as an immutable registry
+    // version (providers/versions/<document version>.json), which usage-ingest prices lines with (it never reads config/).
+    apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'ProviderVersionsWrite', actions: ['s3:GetObject', 's3:PutObject'], resources: [objectArn('providers/versions/*')] }))
+    // Provider API keys the admin enters (ADR 0002): written, described and deleted under <prefix>/providers/ only,
+    // never read (the router reads them). Scoped by name, so no other secret of the account is reachable.
+    apiRole.addToPolicy(new iam.PolicyStatement({ sid: 'ProviderKeys',
+      actions: ['secretsmanager:CreateSecret', 'secretsmanager:PutSecretValue', 'secretsmanager:DescribeSecret', 'secretsmanager:DeleteSecret', 'secretsmanager:RestoreSecret', 'secretsmanager:TagResource'],
+      resources: [`arn:${Aws.PARTITION}:secretsmanager:${Aws.REGION}:${Aws.ACCOUNT_ID}:secret:${cfg.prefix}/providers/*`] }))
 
     // usage-ingest (packages/usage-ingest): asynchronous invokes from the subscription; failures go to the DLQ.
     const ingestLogs = fnLogs('usage-ingest')
@@ -296,6 +320,9 @@ export class ConsoleStack extends Stack {
     ingestRole.addToPolicy(new iam.PolicyStatement({ sid: 'ListConfigBucket', actions: ['s3:ListBucket'], resources: [bucketArn] }))
     // Prices each line with the catalog version it names (C3).
     ingestRole.addToPolicy(new iam.PolicyStatement({ sid: 'CatalogVersions', actions: ['s3:GetObject'], resources: [objectArn('catalog/versions/*')] }))
+    // ... and the provider registry part of a `<catalog>+<registry>` version (design 11-28 §3).
+    ingestRole.addToPolicy(new iam.PolicyStatement({ sid: 'ProviderVersions', actions: ['s3:GetObject'], resources: [objectArn('providers/versions/*')] }))
+
     const dlq = new sqs.Queue(this, 'IngestDlq', {
       queueName: n('usage-ingest-dlq'), enforceSSL: true, encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14),
     })
@@ -437,6 +464,12 @@ export class ConsoleStack extends Stack {
       'Read-only: the dynamic catalog objects (models, versions, change logs, notices, universe) under one prefix; writes are limited to models.json and current.json.')
     ack(ingestRole, `AwsSolutions-IAM5[Resource::arn:aws:s3:::<${ssmRef('configBucket')}>/catalog/versions/*]`,
       'Read-only: the immutable catalog versions, to price each usage line with the version it names.')
+    ack(ingestRole, `AwsSolutions-IAM5[Resource::arn:aws:s3:::<${ssmRef('configBucket')}>/providers/versions/*]`,
+      'Read-only: the immutable provider registry versions, to price external-provider usage lines with the version they name.')
+    ack(apiRole, `AwsSolutions-IAM5[Resource::arn:aws:s3:::<${ssmRef('configBucket')}>/providers/versions/*]`,
+      'The immutable registry versions the console writes at activation (one object per document version) under one prefix.')
+    ack(apiRole, `AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:secretsmanager:<AWS::Region>:<AWS::AccountId>:secret:${cfg.prefix}/providers/*]`,
+      'Provider API keys the admin enters (ADR 0002): create, update, describe and delete under this deployment\'s provider prefix only; never read.')
     ack(apiRole, `AwsSolutions-IAM5[Resource::<${lid(usageTable)}.Arn>/index/*]`, 'Reads on the usage table\'s two GSIs (by day, by principal and session).')
     ack(apiRole, `AwsSolutions-IAM5[Resource::arn:aws:bedrock-agentcore:<AWS::Region>:<AWS::AccountId>:gateway/<${ssmRef('gatewayId')}>/*]`,
       'Get/List on the targets and rules of this one gateway.')

@@ -20,6 +20,7 @@ import { FamilyQueryError, familyRules } from './families.ts'
 import { MOCK_ACCOUNTS } from './idp.ts'
 import type { JwtKey } from './jwt.ts'
 import { changedSections, interimValidator } from './validate.ts'
+import { allowedArns, registryModelIds, registryOf, registryView, routingCatalog, sectionFor } from './providers.ts'
 
 export interface ApiOptions {
   db: MockDb
@@ -107,11 +108,22 @@ export function createApi(o: ApiOptions) {
   const cat = () => currentCatalog(db.catalogMock)
   const universe = () => effectiveUniverse(db.catalogMock)
   const catalogRef = () => ({ region: cat().region, version: cat().version })
-  const validator = { validate: (doc: unknown) => interimValidator({ catalog: cat(), universe: universe(), packs: db.packs.packs }).validate(doc),
-    effects: (prev: ConfigDocument, next: ConfigDocument) => interimValidator({ catalog: cat(), universe: universe(), packs: db.packs.packs }).effects(prev, next) }
+  // ADR 0002: the registry of a document is its providers section, else the deploy-time (baked) one; routing sees its
+  // models too, outside the IAM universe.
+  const registryFor = (doc: ConfigDocument | undefined) => { const s = sectionFor(doc, db.baked); return registryOf(s.section, s.version) }
+  const inForce = () => (active().n >= 1 ? active().document : undefined)
+  const routed = (c = cat(), doc = inForce()) => routingCatalog(c, registryFor(doc))
+  const routable = (doc = inForce()) => [...new Set([...universe(), ...registryModelIds(registryFor(doc))])]
+  const providerCtx = () => ({ boundary: db.boundary, allowedArns: allowedArns(db.baked) })
+  const validatorFor = (doc: unknown, c = cat()) => {
+    const d = (typeof doc === 'object' && doc !== null ? doc : undefined) as ConfigDocument | undefined
+    return interimValidator({ catalog: routed(c, d), universe: routable(d), packs: db.packs.packs, providers: providerCtx() })
+  }
+  const validator = { validate: (doc: unknown) => validatorFor(doc).validate(doc),
+    effects: (prev: ConfigDocument, next: ConfigDocument) => validatorFor(next).effects(prev, next) }
   const catalogRoutes = createCatalogRoutes(db.catalogMock, {
     guarded: () => guardedModelIds(active().document, db.baked),
-    validateWith: (catalog) => interimValidator({ catalog, universe: universe(), packs: db.packs.packs }).validate(active().document),
+    validateWith: (catalog) => validatorFor(active().document, catalog).validate(active().document),
     ...(o.grantMs !== undefined ? { grantMs: o.grantMs } : {}), ...(o.refreshMs !== undefined ? { refreshMs: o.refreshMs } : {}),
     audit: (action, target, summary, extra) => { if (currentCaller) audit(currentCaller, action, target, summary, extra) },
   })
@@ -158,7 +170,11 @@ export function createApi(o: ApiOptions) {
     const policy = pol.doc?.policy as { mode?: RouterMode; version?: string } | undefined
     const assessor = asr.doc?.assessor
     const val = <T,>(s: { source: SettingSource; version?: string }, v: T | undefined) => (v === undefined || s.source === 'unknown' ? { ...s } : { ...s, value: v })
-    const sources = { policy: pol.setting.source, identity: idn.setting.source, assessor: asr.setting.source, access: acc.setting.source }
+    // providers (ADR 0002): 'document' only when the active console document has the section; otherwise the deploy-time
+    // registry applies ('baked'), carried in bakedProviders, never copied into the effective document.
+    const provDoc = !fromBaked && a.document.providers !== undefined
+    const sources = { policy: pol.setting.source, identity: idn.setting.source, assessor: asr.setting.source, access: acc.setting.source,
+      providers: provDoc ? 'document' as const : baked || db.baked.providers ? 'baked' as const : 'unknown' as const }
     const out: NonNullable<ConfigState['effective']> = {
       identityMode: val(idn.setting, idn.doc?.identity?.mode),
       routerMode: val(pol.setting, policy?.mode),
@@ -168,9 +184,11 @@ export function createApi(o: ApiOptions) {
       assessorModel: val(asr.setting, assessor && 'model' in assessor ? assessor.model : undefined),
       sources,
       ...(baked ? { bakedVersion: baked.version } : {}),
+      ...(db.baked.providers ? { bakedProviders: structuredClone(db.baked.providers) } : {}),
     }
-    if (Object.values(sources).every((x) => x !== 'unknown')) {
-      out.document = { ...(fromBaked ? baked! : a.document), policy: pol.doc!.policy, assessor: asr.doc!.assessor!, identity: idn.doc!.identity!, access: acc.doc!.access }
+    if ([pol, idn, asr, acc].every((x) => x.setting.source !== 'unknown')) {
+      const { providers: _p, ...base } = fromBaked ? baked! : a.document
+      out.document = { ...base, policy: pol.doc!.policy, assessor: asr.doc!.assessor!, identity: idn.doc!.identity!, access: acc.doc!.access, ...(provDoc ? { providers: a.document.providers! } : {}) }
     }
     return out
   }
@@ -314,9 +332,9 @@ export function createApi(o: ApiOptions) {
     const age = Date.now() - Date.parse(a.createdAt)
     const router = db.router.reportedVersion === a.version || age > 4000 ? { ...db.router, status: db.router.status === 'rejected' ? 'rejected' as const : 'active' as const, reportedVersion: db.router.status === 'rejected' ? db.router.reportedVersion : a.version } : { status: 'pending' as const, reportedVersion: db.router.reportedVersion }
     const s: ConfigState = {
-      active: a, router: { ...(router as ConfigState['router']), identityKeysLoaded: db.identityKeys.loaded, identityKeys: db.identityKeys }, delivery: db.configDelivery, universe: universe(),
+      active: a, router: { ...(router as ConfigState['router']), identityKeysLoaded: db.identityKeys.loaded, identityKeys: db.identityKeys }, delivery: db.configDelivery, universe: routable(),
       effective: effective(), reported: reported(effective()),
-      catalog: { ...catalogRef(), models: cat().models.map((m) => ({ modelId: m.modelId, tier: m.tier as Tier, dialects: m.dialects as Dialect[], contextWindow: m.contextWindow, price: { input: m.price.input, output: m.price.output }, ...(m.serviceTier ? { serviceTier: m.serviceTier } : {}) })) },
+      catalog: { ...catalogRef(), models: routed().models.map((m) => ({ modelId: m.modelId, tier: m.tier as Tier, dialects: m.dialects as Dialect[], contextWindow: m.contextWindow, price: { input: m.price.input, output: m.price.output }, ...(m.serviceTier ? { serviceTier: m.serviceTier } : {}), ...(m.provider ? { provider: m.provider } : {}) })) },
       ...(db.rulesTranslator ? { rulesTranslator: db.rulesTranslator } : {}),
     }
     if (db.draft) s.draft = db.draft
@@ -665,6 +683,32 @@ export function createApi(o: ApiOptions) {
         }]
       }
       case 'admin.gateway': return [200, db.gateway]
+      case 'admin.providers.get': {
+        const s = sectionFor(inForce(), db.baked)
+        return [200, registryView(registryOf(s.section, s.version), { source: s.source, boundary: db.boundary, managedKeys: db.secretPrefix !== undefined })]
+      }
+      // ADR 0002: write-only provider keys (Secrets Manager <prefix>/providers/<id>); the value is never returned.
+      case 'admin.providers.key.get': case 'admin.providers.key.put': case 'admin.providers.key.delete': {
+        const pid = params.id ?? ''
+        if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(pid)) throw new HttpError(400, 'bad-request', 'id: a provider id')
+        if (db.secretPrefix === undefined) throw new HttpError(503, 'provider-keys-unavailable', 'this deployment gives the console no provider secret prefix')
+        if (id === 'admin.providers.key.get') {
+          const k = db.providerKeys.get(pid)
+          return [200, k ? { set: true, updatedAt: k.updatedAt } : { set: false }]
+        }
+        if (id === 'admin.providers.key.put') {
+          const b = asBody<{ key?: unknown }>(await readJson(req))
+          const key = b.key
+          if (typeof key !== 'string' || key.length < 1 || key.length > 4096 || !/^[\x20-\x7E]+$/.test(key)) throw new HttpError(400, 'bad-request', 'key: 1-4096 printable characters')
+          const updatedAt = new Date().toISOString()
+          db.providerKeys.set(pid, { value: key, updatedAt })
+          audit(c, 'provider.key.set', `provider:${pid}`, `Set the key of provider ${pid}`, { after: { action: 'set', providerId: pid } })
+          return [200, { set: true, updatedAt }]
+        }
+        db.providerKeys.delete(pid)
+        audit(c, 'provider.key.delete', `provider:${pid}`, `Scheduled deletion of the key of provider ${pid}`, { after: { action: 'delete', providerId: pid } })
+        return [200, { set: false }]
+      }
       case 'admin.audit': {
         const q: AuditQuery = { ...dayRange(sp) }
         const actor = qStr(sp, 'actor'); const action = qList(sp, 'action'); const target = qStr(sp, 'target')

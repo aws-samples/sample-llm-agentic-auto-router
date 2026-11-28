@@ -12,7 +12,7 @@ export { assessorModelOf, guardedModelIds, policyModelIdsOf } from './guarded.ts
 export { baseModelId, checkPolicyAgainstCatalog, DEFAULT_ALIASES, DEFAULT_PORTABILITY, failoverOtherModel, POLICY_DEFAULTS, PolicyError, RETRYABLE_STATUS, RULE_WHEN_KEYS, STRIP_KEYS_MAX,
   STRIPPABLE_TAGS, validatePolicy, validateRules, WHEN_TOKEN_RE } from './policy.ts'
 export { createEngine, type EngineOptions } from './engine.ts'
-export { AccessCapError, BREAK_POINTS, NoEligibleModelError } from './decide.ts'
+export { AccessCapError, BREAK_POINTS, NoEligibleModelError, PinNotPortableError } from './decide.ts'
 export { InMemoryStateStore } from './store-memory.ts'
 export { templateFamilyOf } from './summarize/index.ts'
 export { defaultEstimateTokens } from './summarize/tokens.ts'

@@ -7,7 +7,7 @@
 // Image-dependent inputs (the packs the image bundles, the assessor adapter check) are passed in by the caller:
 // router = what its image bundles; console = the manifest of the image ECS reports as running.
 import { checkPolicyAgainstCatalog, PolicyError, validateCap, validatePolicy, type Cap, type Policy } from '@auto-router/core/policy'
-import { findModel, type ModelPrice, type PriceCatalog } from '@auto-router/pricing'
+import { findModel, mergeRegistry, providersIssues, REGISTRY_VERSION_PATTERN, type EgressBoundary, type ModelPrice, type PriceCatalog, type ProviderRegistry, type ProvidersSection } from '@auto-router/pricing'
 import { CUSTOM_RULE_LIMITS, PRESET_CUSTOM_RULES, validateCustomRules, type CustomRule } from '@auto-router/assessor/custom'
 
 export type { CustomRule, CustomRuleState } from '@auto-router/assessor/custom'
@@ -203,6 +203,37 @@ export interface ConfigDocument {
   /** Identity settings (C2). Only `mode` is checked here; other fields pass through. */
   identity?: { mode: IdentityMode } & Record<string, unknown>
   access: { groups: Partial<Record<GroupName, Cap>> }
+  /**
+   * Console-managed providers (11-28-console-providers §2.1, ADR 0002): the provider registry of this document, as a
+   * registry of version `version` (documentRegistry). Absent: the baked registry (providersFile); `{ providers: [] }`:
+   * Bedrock only. Validated only when the caller gives a ProvidersContext.
+   */
+  providers?: ProvidersSection
+}
+
+/** What a providers section is checked against (validateConfigDocument `opts.providers`). */
+export interface ProvidersContext {
+  /** The deployment's egress boundary (router: ROUTER_PROVIDER_BOUNDARY; console: its SSM parameter). */
+  boundary: EgressBoundary
+  /** A deployed router or console: no env secrets, arn secrets only from `allowedArns` (providersIssues). */
+  deployed: boolean
+  /** The secret ARNs the deployment granted: the baked registry's. */
+  allowedArns?: readonly string[]
+  /** The baked registry (providersFile): what a document without a providers section runs. */
+  baked?: ProviderRegistry
+}
+
+/**
+ * The provider registry a document runs: its providers section as a registry whose version is the document's version,
+ * else `baked`. The effective catalog is mergeRegistry(<Bedrock catalog>, this), version `<catalog>+<registry version>`.
+ */
+export function documentRegistry(doc: { version: string; providers?: ProvidersSection }, baked: ProviderRegistry | undefined): ProviderRegistry | undefined {
+  return doc.providers ? { schemaVersion: 1, version: doc.version, providers: doc.providers.providers } : baked
+}
+
+/** The secret ARNs of a registry (ProvidersContext.allowedArns of a deployment whose baked registry it is). */
+export function registryArns(registry: ProviderRegistry | undefined): string[] {
+  return (registry?.providers ?? []).flatMap((p) => (p.auth.scheme !== 'none' && 'arn' in p.auth.secret ? [p.auth.secret.arn] : []))
 }
 
 export type Checked<T> = { ok: true; value: T; warnings?: string[] } | { ok: false; issues: string[] }
@@ -232,27 +263,55 @@ function unknownPolicyKeys(policy: unknown): string[] {
  * packs to check it against. Every issue is reported. The result never depends on a previous document (design 0.9:
  * no diff-based rejection).
  *
+ * Providers (11-28-console-providers): with `opts.providers`, `catalog` is the Bedrock catalog; the providers section
+ * (when present) is checked by providersIssues under the context's boundary, its document's version must be a registry
+ * version (no ':' or '+', at most 64 characters), and the policy and the assessor are checked against the effective
+ * catalog mergeRegistry(catalog, documentRegistry(doc, baked)). Issues of the section start with `providers`. Without
+ * `opts.providers`, `catalog` is used as given and a providers section is an unknown field.
+ *
  * A policy key the schema does not know is an issue (the console refuses such a document). The router itself reads
  * the active document with `unknownPolicyKeys: 'warn'`: a document activated before that check (2026-11-17) keeps
  * working, with a `policy-unknown-key:<path>` warning on its config line, instead of dropping the deployment to its
  * baked policy on the next image.
  */
-export function validateConfigDocument(raw: unknown, catalog: PriceCatalog,
-  opts: { assessor?: AssessorSettingsContext; unknownPolicyKeys?: 'reject' | 'warn' } = {}): Checked<ConfigDocument> {
+export function validateConfigDocument(raw: unknown, bedrockOrEffective: PriceCatalog,
+  opts: { assessor?: AssessorSettingsContext; unknownPolicyKeys?: 'reject' | 'warn'; providers?: ProvidersContext } = {}): Checked<ConfigDocument> {
   const issues: string[] = []
   const warnings: string[] = []
   if (!isObj(raw)) return { ok: false, issues: ['document: object required'] }
-  for (const k of Object.keys(raw)) if (!DOC_KEYS.includes(k)) issues.push(`${k}: unknown field`)
+  const pctx = opts.providers
+  for (const k of Object.keys(raw)) if (!DOC_KEYS.includes(k) && !(k === 'providers' && pctx)) issues.push(`${k}: unknown field`)
   if (raw.schemaVersion !== 1) issues.push('schemaVersion: 1 required')
   const seq = parseConfigVersion(raw.version)
   if (seq === undefined) issues.push(`version: "<n>-<suffix>" required, got ${JSON.stringify(raw.version)?.slice(0, 80)}`)
+  // The catalog the policy and the assessor are checked against (undefined: the providers section is invalid, so the
+  // models it would add are unknown and only the policy's own schema is checked).
+  let catalog: PriceCatalog | undefined = bedrockOrEffective
+  let providers: ProvidersSection | undefined
+  if (pctx) {
+    let registry = pctx.baked
+    if (raw.providers !== undefined) {
+      const pi = providersIssues(raw.providers, pctx.boundary, { deployed: pctx.deployed, ...(pctx.allowedArns ? { allowedArns: pctx.allowedArns } : {}) })
+      if (pi.length > 0) { issues.push(...pi); catalog = undefined }
+      else if (typeof raw.version !== 'string' || !REGISTRY_VERSION_PATTERN.test(raw.version)) {
+        issues.push(`version: a document with a providers section needs a version matching ${REGISTRY_VERSION_PATTERN.source}`)
+        catalog = undefined
+      } else {
+        providers = { providers: (raw.providers as ProvidersSection).providers }
+        registry = documentRegistry({ version: raw.version, providers }, undefined)
+      }
+    }
+    if (catalog) {
+      try { catalog = mergeRegistry(catalog, registry) } catch (e) { issues.push(`providers: ${(e as Error).message}`); catalog = undefined }
+    }
+  }
   let policy: Policy | undefined
   try {
     if (opts.unknownPolicyKeys === 'warn') {
       policy = validatePolicy(raw.policy, { unknownKeys: 'ignore' })
       warnings.push(...unknownPolicyKeys(raw.policy))
     } else policy = validatePolicy(raw.policy)
-    checkPolicyAgainstCatalog(policy, catalog)
+    if (catalog) checkPolicyAgainstCatalog(policy, catalog)
   } catch (e) {
     if (e instanceof PolicyError) issues.push(...e.issues.map((i) => `policy.${i}`))
     else issues.push(`policy: ${(e as Error).message}`)
@@ -262,8 +321,9 @@ export function validateConfigDocument(raw: unknown, catalog: PriceCatalog,
     if (!isObj(raw.assessor)) issues.push('assessor: object required')
     else if (opts.assessor) {
       // With the caller's packs (console: the running image's manifest) the block is checked here too; the router
-      // checks it in its AssessorBuilder with the packs it preloaded.
-      const r = validateAssessorSettings(raw.assessor, opts.assessor)
+      // checks it in its AssessorBuilder with the packs it preloaded. With a ProvidersContext, against the effective
+      // catalog of this document.
+      const r = validateAssessorSettings(raw.assessor, pctx && catalog ? { ...opts.assessor, catalog } : opts.assessor)
       for (const w of r.warnings) warnings.push(`assessor.${w.field}: ${w.code}: ${w.message}`)
       if (r.ok) assessor = r.value as unknown as Record<string, unknown>
       else issues.push(...r.issues.map((i) => `assessor.${i.field}: ${i.code}: ${i.message}`))
@@ -293,6 +353,7 @@ export function validateConfigDocument(raw: unknown, catalog: PriceCatalog,
   const doc: ConfigDocument = { schemaVersion: 1, version: raw.version as string, seq, policy, access }
   if (assessor) doc.assessor = assessor
   if (identity) doc.identity = identity
+  if (providers) doc.providers = providers
   return { ok: true, value: doc, ...(warnings.length ? { warnings } : {}) }
 }
 
@@ -361,6 +422,12 @@ export interface BakedInputs {
   env: BakedEnv
   /** The packs the image bundles (router: packInfos(config.packs); synth: the committed manifest's entries). */
   packs: readonly PackInfo[]
+  /**
+   * The deploy's provider registry (router: ROUTER_PROVIDERS_JSON/_FILE; synth: providersFile). Present: the document
+   * carries it as its `providers` section (the registry's own version is not part of it). Absent: no `providers` key,
+   * so a deploy without a registry has the same document and version as before console-managed providers.
+   */
+  providers?: ProviderRegistry
 }
 
 /**
@@ -376,6 +443,7 @@ export function bakedConfigDocument(inputs: BakedInputs, sha256Hex: (text: strin
     assessor: bakedAssessorBlock(inputs.env, inputs.packs) as unknown as Record<string, unknown>,
     identity: { mode: identityModeOf(inputs.env.ROUTER_IDENTITY_MODE) },
     access: { groups: {} },
+    ...(inputs.providers ? { providers: { providers: inputs.providers.providers } } : {}),
   }
   const version = `0-baked.${sha256Hex(canonicalJson(content)).slice(0, 8)}`
   return { ...content, version, seq: 0 }

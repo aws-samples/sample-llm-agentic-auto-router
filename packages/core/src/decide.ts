@@ -25,6 +25,24 @@ export class AccessCapError extends Error {
   }
 }
 
+/**
+ * A pin to a model of another provider than the lineage's current model, while the request carries conversation state
+ * that cannot cross a provider and cannot be stripped (thinking signatures, Kimi reasoning content, a
+ * previous_response_id chain, or more encrypted reasoning keys than STRIP_KEYS_MAX). The router answers 400 with the
+ * code before any upstream call. `tags`: the blocking state tags (codes).
+ */
+export class PinNotPortableError extends Error {
+  readonly code = 'pin-not-portable' as const
+  readonly dialect: Dialect
+  readonly tags: string[]
+  constructor(dialect: Dialect, tags: string[]) {
+    super(`pin-not-portable for ${dialect}: ${tags.join(',')}`)
+    this.name = 'PinNotPortableError'
+    this.dialect = dialect
+    this.tags = tags
+  }
+}
+
 export class NoEligibleModelError extends Error {
   readonly dialect: Dialect
   constructor(dialect: Dialect, detail: string) {
@@ -78,8 +96,8 @@ export async function decide(ctx: DecideContext, s: RequestSummary, extras?: Dec
 
   // 1. Pinned (R11). A concrete model is a pin in both modes (admin console 0.3a): auto would pin it, so an observe
   // evaluation of it would describe something auto never does. The caller checks pins against the access cap.
-  if (s.hints.pin) return { ...base, action: 'pin', model: s.hints.pin, point: 'pinned', reason: `pin: x-router-pin ${s.hints.pin}; ${tag}` }
-  if (!isAlias) return { ...base, action: 'pin', model: requested, point: 'pinned', reason: `pin: concrete model ${requested}; ${tag}` }
+  if (s.hints.pin) return pinned(ctx, s, { ...base, action: 'pin', model: s.hints.pin, point: 'pinned', reason: `pin: x-router-pin ${s.hints.pin}; ${tag}` })
+  if (!isAlias) return pinned(ctx, s, { ...base, action: 'pin', model: requested, point: 'pinned', reason: `pin: concrete model ${requested}; ${tag}` })
 
   const pool = policy.pools[s.dialect]
   if (!pool || pool.models.length === 0) throw new NoEligibleModelError(s.dialect, 'no pool configured')
@@ -203,6 +221,47 @@ export async function decide(ctx: DecideContext, s: RequestSummary, extras?: Dec
   return provisional
 }
 
+/** The provider of a model: the catalog entry's, else the id's prefix before the first '/', else Bedrock. */
+function providerOfModel(ctx: DecideContext, model: string): string {
+  const p = ctx.catalog.get(model)?.provider
+  if (p !== undefined) return p
+  const slash = model.indexOf('/')
+  return slash < 0 ? 'bedrock' : model.slice(0, slash)
+}
+
+/**
+ * A pin across providers (11-28 external providers): a pin may move a lineage anywhere, but conversation state never
+ * crosses a provider. Same provider as the lineage's current model (or no current model): served as pinned. Another
+ * provider: strippable state (STRIPPABLE_TAGS) is dropped like a strip-upgrade move, whatever policy.portability says
+ * (the reason ends `; strip:<tag>`); any other non-portable state, a previous_response_id chain, or a strip set over
+ * STRIP_KEYS_MAX throws PinNotPortableError. A lineage that stripped before carries its stored keys on every pin.
+ */
+async function pinned(ctx: DecideContext, s: RequestSummary, d: Decision): Promise<Decision> {
+  let state = await ctx.store.get(s.session.lineage)
+  // A chain continued under another lineage, as decide() reads it (no side call reads the main conversation's state).
+  if (state === undefined && s.previousResponseId && s.hints.sideCall === undefined) {
+    const alias = `resp:${s.previousResponseId}`
+    if (alias !== s.session.lineage) {
+      const a = await ctx.store.get(alias)
+      if (a?.current !== undefined) state = a
+    }
+  }
+  const current = state?.current
+  const crosses = current !== undefined && providerOfModel(ctx, current) !== providerOfModel(ctx, d.model)
+  if (!crosses) {
+    const kept = storedStrip(state)
+    return kept ? { ...d, strip: kept } : d
+  }
+  const blocking = s.nonPortableState.filter((t) => !STRIPPABLE_TAGS.has(t))
+  if (s.previousResponseId) blocking.push('previous-response-id')
+  const strippable = s.nonPortableState.some((t) => STRIPPABLE_TAGS.has(t))
+  const keys = strippable || state?.stripKeys?.length ? stripSetOf(s, state) : []
+  if (keys.length > STRIP_KEYS_MAX) blocking.push('strip-keys-max')
+  if (blocking.length > 0) throw new PinNotPortableError(s.dialect, blocking)
+  if (keys.length === 0) return d
+  return { ...d, reason: strippable ? `${d.reason}; strip:${STRIP_TAG}` : d.reason, strip: { tag: STRIP_TAG, keys } }
+}
+
 /** Registers a decision's late part; `run` starts now (the consultation and its memo entry exist before decide returns). */
 function deferLate(ctx: DecideContext, s: RequestSummary, fields: ReadonlySet<DeferredField>, run: () => Promise<DecisionPatch>, backstop: () => DecisionPatch): void {
   ctx.late?.set(s, lateOf(run().catch(backstop), fields))
@@ -302,7 +361,9 @@ function evaluateSteps(
   // a gate fallback never lands on a model that cannot take the history).
   const restricted = current !== undefined && s.nonPortableState.length > 0
   const rule = restricted ? strictest(s.nonPortableState, policy.portability) : undefined
+  // A family is scoped to one provider (ADR 0001): the same model line from two providers is two families.
   const sameFamily = (c: Candidate): boolean => currentPrice !== undefined && c.price.family === currentPrice.family
+    && (c.price.provider ?? 'bedrock') === (currentPrice.provider ?? 'bedrock')
   const strict = restricted ? inPool.filter((c) => c === currentEntry || (rule === 'same-family' && sameFamily(c))) : inPool
   // 'strip-upgrade' (task 11-20, decision A): a strictly higher tier is reachable too, outside tool loops and response
   // chains, when the strip set stays within its cap; the router then drops the stripped tag's items. A tag that is not

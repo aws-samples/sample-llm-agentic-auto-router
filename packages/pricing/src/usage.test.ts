@@ -286,3 +286,43 @@ describe('openai-chat Kimi K3 fixtures', () => {
     expect(fromStream('openai-chat', 'openai-chat/kimi-k3-stream-read.sse.txt')).toEqual(expected)
   })
 })
+
+describe('standard OpenAI cached-token parsing (external providers rely on it)', () => {
+  it('chat prompt_tokens_details.cached_tokens is a cache read inside the prompt total', () => {
+    expect(normalizeUsage('openai-chat', { usage: { prompt_tokens: 1000, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 600 } } })).toEqual({
+      uncachedInputTokens: 400, cacheReadTokens: 600, cacheWriteTokens: {}, outputTokens: 7, promptTokens: 1000,
+    })
+  })
+})
+
+describe('quirks.usage', () => {
+  const quirks = { usage: { cacheReadTokens: 'prompt_cache_hit_tokens', cacheWriteTokens: 'x.cache_write' } }
+
+  it('overrides chat read / write counts from dot paths, keeping the prompt total', () => {
+    const body = { usage: { prompt_tokens: 1000, completion_tokens: 5, prompt_cache_hit_tokens: 700, x: { cache_write: 200 } } }
+    expect(normalizeUsage('openai-chat', body, quirks)).toEqual({
+      uncachedInputTokens: 100, cacheReadTokens: 700, cacheWriteTokens: { '30m': 200 }, outputTokens: 5, promptTokens: 1000,
+    })
+  })
+  it('keeps the standard count when the quirk field is absent', () => {
+    const body = { usage: { prompt_tokens: 1000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 300 } } }
+    expect(normalizeUsage('openai-chat', body, quirks)).toEqual(normalizeUsage('openai-chat', body))
+  })
+  it('Anthropic: input_tokens stays uncached, writes go to 5m', () => {
+    const body = { usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, my_read: 500, x: { cache_write: 40 } } }
+    expect(normalizeUsage('anthropic-messages', body, { usage: { cacheReadTokens: 'my_read', cacheWriteTokens: 'x.cache_write' } })).toEqual({
+      uncachedInputTokens: 10, cacheReadTokens: 500, cacheWriteTokens: { '5m': 40 }, outputTokens: 2, promptTokens: 550,
+    })
+  })
+  it('applies to streams', () => {
+    const acc = createStreamUsageAccumulator('openai-chat', quirks)
+    acc.push({ data: JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }) })
+    acc.push({ data: JSON.stringify({ choices: [], usage: { prompt_tokens: 50, completion_tokens: 1, prompt_cache_hit_tokens: 20 } }) })
+    acc.push({ data: '[DONE]' })
+    expect(acc.result()).toEqual({ uncachedInputTokens: 30, cacheReadTokens: 20, cacheWriteTokens: {}, outputTokens: 1, promptTokens: 50 })
+  })
+  it('ignores non-numeric quirk values', () => {
+    const body = { usage: { input_tokens: 10, output_tokens: 3, input_tokens_details: { cached_tokens: 4 }, prompt_cache_hit_tokens: 'n/a' } }
+    expect(normalizeUsage('openai-responses', body, quirks)).toEqual(normalizeUsage('openai-responses', body))
+  })
+})

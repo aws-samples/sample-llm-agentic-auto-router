@@ -1,4 +1,4 @@
-# Router stack catalog Lambdas (ARM64): catalog-refresh, catalog-grant, catalog-grant-cleanup; each function selects its handler with
+# Router stack catalog Lambdas (ARM64): catalog-refresh, catalog-grant, catalog-grant-cleanup, provider-dns-sync (nat-dns); each function selects its handler with
 # the image CMD (infra/src/stack.ts CATALOG_LAMBDA_CMD). Build context: the repository root, filtered by the
 # RouterStack's asset excludes (catalogLambdaCode). Separate from the console image on purpose: the IAM-writing
 # function carries no console code.

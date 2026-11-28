@@ -60,6 +60,11 @@ describe('llmar-mvp stack', () => {
   it('has no internet path: no IGW, no NAT, no public IPs', () => {
     template.resourceCountIs('AWS::EC2::InternetGateway', 0)
     template.resourceCountIs('AWS::EC2::NatGateway', 0)
+    template.resourceCountIs('AWS::EC2::EIP', 0)
+    template.resourceCountIs('AWS::NetworkFirewall::Firewall', 0)
+    template.resourceCountIs('AWS::Route53Resolver::FirewallRuleGroupAssociation', 0)
+    const egress = ofType('AWS::EC2::SecurityGroup').flatMap(([, r]) => (r.Properties?.SecurityGroupEgress ?? []) as { CidrIp?: string }[])
+    expect(egress.filter((e) => e.CidrIp === '0.0.0.0/0')).toEqual([])
     for (const [, s] of ofType('AWS::EC2::Subnet')) expect(s.Properties?.MapPublicIpOnLaunch ?? false).toBe(false)
     const svc = ofType('AWS::ECS::Service')[0]?.[1]
     expect(svc?.Properties?.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp).toBe('DISABLED')
@@ -496,10 +501,10 @@ describe('admin console identity (spike C1 decisions)', () => {
     expect(dep[0]?.Properties?.Prune).toBe(false)
     expect(dep[0]?.Properties?.DestinationBucketKeyPrefix).toBeUndefined()
     expect(JSON.stringify(dep[0]?.Properties?.DestinationBucketName)).toContain('Config')
-    expect(dep[0]?.Properties?.SourceObjectKeys).toHaveLength(3) // packs archive + baked.json + baked/<version>.json
+    expect(dep[0]?.Properties?.SourceObjectKeys).toHaveLength(4) // packs archive + baked.json + baked/<version>.json + providers/active.json (empty registry)
     // No archive dir (-c packsArchive=off): the same deployment still stages the baked document.
     const [, only] = ofType('Custom::CDKBucketDeployment')[0] as [string, { Properties?: Record<string, any> }]
-    expect(only.Properties?.SourceObjectKeys).toHaveLength(2)
+    expect(only.Properties?.SourceObjectKeys).toHaveLength(3) // baked.json, baked/<version>.json, providers/active.json
     expect(ofType('Custom::CDKBucketDeployment')).toHaveLength(1)
     expect(() => build(true, SETTINGS, packsFixture()).app.synth()).not.toThrow()
   })
@@ -514,7 +519,7 @@ describe('admin console identity (spike C1 decisions)', () => {
     expect(notRes).toMatch(/\/packs\/\*"/)
     expect(notRes).toMatch(/\/config\/baked\.json"/)
     expect(notRes).toMatch(/\/config\/baked\/\*"/)
-    expect(deny?.NotResource).toHaveLength(3) // never config/active.json, config/versions/* or identity/*
+    expect(deny?.NotResource).toHaveLength(4) // packs/*, baked.json, baked/*, providers/active.json: never config/active.json, config/versions/* or identity/*
     expect(deny?.Resource).toBeUndefined()
     // The only principal is the BucketDeployment handler role, never the task, jwks-sync or auto-delete roles.
     const principal = JSON.stringify(deny?.Principal)

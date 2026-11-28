@@ -6,7 +6,7 @@ import type {
   ConfigState, ConfigVersionMeta, CreateClientRequest, DeploymentSettings, GatewayInfo, HealthRange, HealthReport, InviteRequest, LatestResponse,
   Member, MemberAction, MemberDetail, MemberPatch, PackEntry, PacksResponse, Page, Profile, RecordDetail, RecordLookup, RecordQuery, RecordSummary, SavingsQuery,
   SavingsReport, ServiceClient, SessionDetail, SettingsPatch, SetupInfo, UsageQuery, TranslateRulesRequest, TranslateRulesResponse, UsageReport, ValidateResponse,
-  CatalogRefreshBody, CatalogRefreshResponse, CustomRulesEvidenceResponse, FamilyRulesResponse, CatalogRollbackBody, CatalogVersionsResponse, ModelAddBody, ModelEditBody, ModelMutationResponse, ModelsResponse,
+  CatalogRefreshBody, CatalogRefreshResponse, CustomRulesEvidenceResponse, FamilyRulesResponse, CatalogRollbackBody, CatalogVersionsResponse, ModelAddBody, ModelEditBody, ModelMutationResponse, ModelsResponse, ProviderKeyStatus, ProviderRegistryView,
 } from '@auto-router/console-contract'
 import { pathOf, toQuery } from '@auto-router/console-contract'
 import { keepPreviousData, QueryClient, useMutation, useQuery, useQueryClient, type UseQueryOptions } from '@tanstack/react-query'
@@ -97,6 +97,11 @@ export const useBudgets = () => useGet<BudgetsResponse>(['budgets'], '/api/admin
 export const useSettings = () => useGet<DeploymentSettings>(['settings'], '/api/admin/settings')
 /** Dynamic catalog (C3/C4). `pollMs` while a grant sync or a refresh is outstanding. */
 export const useModels = (pollMs?: number | false) => useGet<ModelsResponse>(['models'], '/api/admin/models', { refetchInterval: pollMs ?? false })
+/** The provider registry in force, the egress boundary and whether keys can be stored (ADR 0002). */
+export const useProviders = () => useGet<ProviderRegistryView>(['providers'], '/api/admin/providers')
+/** Whether a provider key is stored (never the key); off while `enabled` is false (no secret prefix). */
+export const useProviderKey = (id: string | undefined, enabled = true) =>
+  useGet<ProviderKeyStatus>(['providers', 'key', id], id && enabled ? pathOf('/api/admin/providers/:id/key', { id }) : undefined, { retry: false })
 export const useCatalogVersions = (pollMs?: number | false) => useGet<CatalogVersionsResponse>(['catalog', 'versions'], '/api/admin/catalog/versions', { refetchInterval: pollMs ?? false })
 
 /** `onError: true` also re-reads after a failure (the server may have kept part of the change, or the data moved). */
@@ -125,7 +130,10 @@ export const useTranslateRules = () => useMut<TranslateRulesRequest, TranslateRu
 export const useValidateConfig = () => useMut<{ document: ConfigDocument }, ValidateResponse>((a, v) => a.post('/api/admin/config/validate', v), [])
 export const useSaveDraft = () => useMut<{ document: ConfigDocument; baseVersion: string }, ConfigState>((a, v) => a.put('/api/admin/config', v), [['config']])
 export const useDiscardDraft = () => useMut<void, ConfigState>((a) => a.delete('/api/admin/config'), [['config']])
-export const useActivate = () => useMut<ActivateRequest, ActivateResponse>((a, v) => a.post('/api/admin/config/activate', v), [['config'], ['audit'], ['profile'], ['setup']])
+export const useActivate = () => useMut<ActivateRequest, ActivateResponse>((a, v) => a.post('/api/admin/config/activate', v), [['config'], ['audit'], ['profile'], ['setup'], ['providers']])
+/** Write-only: the key goes to Secrets Manager and is never sent back. */
+export const usePutProviderKey = () => useMut<{ id: string; key: string }, ProviderKeyStatus>((a, v) => a.put(pathOf('/api/admin/providers/:id/key', { id: v.id }), { key: v.key }), [['providers', 'key'], ['audit']])
+export const useDeleteProviderKey = () => useMut<{ id: string }, ProviderKeyStatus>((a, v) => a.delete(pathOf('/api/admin/providers/:id/key', { id: v.id })), [['providers', 'key'], ['audit']])
 export const usePutBudgets = () => useMut<BudgetsPatch, unknown>((a, v) => a.put('/api/admin/budgets', v), [['budgets'], ['audit']])
 export const useRepublishIdentity = () => useMut<void, { identity: Delivery }>((a) => a.post('/api/admin/identity/republish'), [['members'], ['clients'], ['settings'], ['audit']])
 export const useRedeliverConfig = () => useMut<void, ConfigState>((a) => a.post('/api/admin/config/redeliver'), [['config'], ['audit']])

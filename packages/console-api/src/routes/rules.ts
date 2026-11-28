@@ -8,6 +8,7 @@ import { HttpError, jsonBody, requireObject } from '../http.ts'
 import { TEXT_MAX, TRANSLATE_TIMEOUT_MS, TranslateError, type TierModels } from '../rules-translate.ts'
 import { audit } from './common.ts'
 import { activeDocument } from './config.ts'
+import { routingCatalog } from '../providers.ts'
 
 const TIERS: readonly Tier[] = ['fast', 'standard', 'frontier']
 
@@ -20,7 +21,7 @@ async function tierModels(ctx: Ctx): Promise<TierModels> {
     const out: TierModels = {}
     for (const d of Object.keys(policy.pools) as Dialect[]) {
       const row: Partial<Record<Tier, string>> = {}
-      for (const t of TIERS) { const m = modelForTier(policy, ctx.deps.catalog, d, t); if (m !== undefined) row[t] = m }
+      for (const t of TIERS) { const m = modelForTier(policy, routingCatalog(ctx.deps), d, t); if (m !== undefined) row[t] = m }
       out[d] = row
     }
     return out

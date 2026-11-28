@@ -1,0 +1,24 @@
+# LiteLLM proxy for the external-provider live test (design 11-28 §6). Loopback only; Bedrock via SigV4 with the
+# spike account's credentials from the environment (AWS_PROFILE), Region from LLMAR_EXT_REGION.
+model_list:
+  # Native Bedrock Chat Completions and Responses (LiteLLM routes GPT-6 to bedrock-runtime /openai/v1 by default).
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: bedrock/global.openai.gpt-6-luna
+      aws_region_name: os.environ/LLMAR_EXT_REGION
+  # Same model under a second name: the registry lists it one tier up, so scenario 7 can move a conversation across
+  # providers by tier (an upgrade) instead of by pin.
+  - model_name: gpt-6-luna-std
+    litellm_params:
+      model: bedrock/global.openai.gpt-6-luna
+      aws_region_name: os.environ/LLMAR_EXT_REGION
+  # /v1/messages on a plain bedrock/ Claude model goes down Bedrock Invoke with the Anthropic body.
+  - model_name: claude-haiku-5-5
+    litellm_params:
+      model: bedrock/global.anthropic.claude-haiku-5-5
+      aws_region_name: os.environ/LLMAR_EXT_REGION
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+litellm_settings:
+  drop_params: false
+  telemetry: false

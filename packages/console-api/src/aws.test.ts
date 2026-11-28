@@ -2,7 +2,8 @@
 // activation, Cognito rotation and guards, the first-admin seed, the Lambda environment contract.
 import { describe, expect, it } from 'vitest'
 import { decodeCursor, DynamoConsoleStore, DynamoUsageStore, encodeCursor, fromItem, toItem, type Sender } from './aws/dynamo.ts'
-import { AgentCoreGateway, CognitoClientDirectory, CognitoDirectory, EcsRouterTasks, S3ObjectStore } from './aws/services.ts'
+import { AgentCoreGateway, CognitoClientDirectory, CognitoDirectory, EcsRouterTasks, LambdaInvoker, S3ObjectStore } from './aws/services.ts'
+import { SecretsManagerKeyStore } from './aws/secrets.ts'
 import { depsFromEnv, EnvError, type AwsClients } from './lambda.ts'
 import { seedAdmin } from './seed.ts'
 import { baseDocument } from './test-fixtures.ts'
@@ -343,5 +344,86 @@ describe('depsFromEnv (a3 ConsoleStack env contract)', () => {
   it('fails fast on missing or invalid keys', () => {
     expect(() => depsFromEnv({ ...env, CONSOLE_TABLE: '', CALLBACK_PORTS: '80' }, clients)).toThrow(EnvError)
     expect(() => depsFromEnv({ ...env, CONSOLE_TABLE: '' }, clients)).toThrow(/CONSOLE_TABLE/)
+  })
+  it('ADR 0002: PROVIDER_BOUNDARY (JSON) and PROVIDER_SECRET_PREFIX; unset = mode none and no key store', () => {
+    const none = depsFromEnv(env, clients)
+    expect(none.env.providerBoundary).toBeUndefined()
+    expect(none.env.providerSecretPrefix).toBeUndefined()
+    expect(none.providerKeys).toBeUndefined()
+    const boundary = { mode: 'firewall', hosts: ['*.example.com'], cidrs: [] }
+    const d = depsFromEnv({ ...env, PROVIDER_BOUNDARY: JSON.stringify(boundary), PROVIDER_SECRET_PREFIX: 'llmar' }, { ...clients, secretsmanager: fake(() => ({})) })
+    expect(d.env.providerBoundary).toEqual(boundary)
+    expect(d.env.providerSecretPrefix).toBe('llmar')
+    expect(d.providerKeys).toBeInstanceOf(SecretsManagerKeyStore)
+    const off = depsFromEnv({ ...env, PROVIDER_BOUNDARY: JSON.stringify({ mode: 'none', hosts: [], cidrs: [] }), PROVIDER_SECRET_PREFIX: 'none' }, clients)
+    expect(off.env.providerSecretPrefix).toBeUndefined()
+    expect(off.providerKeys).toBeUndefined()
+    expect(off.env.providerBoundary).toEqual({ mode: 'none', hosts: [], cidrs: [] })
+    expect(() => depsFromEnv({ ...env, PROVIDER_BOUNDARY: '{"mode":"open"}' }, clients)).toThrow(/PROVIDER_BOUNDARY/)
+    expect(() => depsFromEnv({ ...env, PROVIDER_BOUNDARY: 'not json' }, clients)).toThrow(/PROVIDER_BOUNDARY/)
+    expect(() => depsFromEnv({ ...env, PROVIDER_SECRET_PREFIX: 'bad prefix/' }, { ...clients, secretsmanager: fake(() => ({})) })).toThrow(/PROVIDER_SECRET_PREFIX/)
+    expect(() => depsFromEnv({ ...env, PROVIDER_SECRET_PREFIX: 'llmar' }, clients)).toThrow(/secretsmanager client/)
+  })
+})
+
+describe('provider-dns-sync wiring (ADR 0003)', () => {
+  const clients: AwsClients = { dynamodb: fake(() => ({})), s3: fake(() => ({})), cognito: fake(() => ({})), agentcore: fake(() => ({})), cloudwatch: fake(() => ({})), ecs: fake(() => ({})) }
+  const env = {
+    CONSOLE_TABLE: 'c', USAGE_TABLE: 'u', CONFIG_BUCKET: 'b', USER_POOL_ID: 'p', PREFIX: 'llmar', CONSOLE_SCOPE: 'llmar/console', INVOKE_SCOPE: 'llmar/invoke',
+    GATEWAY_ID: 'gw', MODEL_UNIVERSE: 'a, b', ROUTER_CLUSTER: 'cl', ROUTER_SERVICE: 'sv', CLI_CLIENT_ID: 'cli', AWS_REGION: 'ap-northeast-1',
+  }
+  const natDns = JSON.stringify({ mode: 'nat-dns', hosts: ['*'], cidrs: [] })
+  it('PROVIDER_DNS_SYNC_FUNCTION: none or unset = off; a name needs a nat-dns boundary and a Lambda client', () => {
+    expect(depsFromEnv({ ...env, PROVIDER_DNS_SYNC_FUNCTION: 'none' }, clients).env.providerDnsSyncFunction).toBeUndefined()
+    const d = depsFromEnv({ ...env, PROVIDER_BOUNDARY: natDns, PROVIDER_DNS_SYNC_FUNCTION: 'llmar-provider-dns-sync' }, { ...clients, lambda: fake(() => ({})) })
+    expect(d.env.providerDnsSyncFunction).toBe('llmar-provider-dns-sync')
+    expect(d.invoker).toBeInstanceOf(LambdaInvoker)
+    expect(() => depsFromEnv({ ...env, PROVIDER_DNS_SYNC_FUNCTION: 'llmar-provider-dns-sync' }, { ...clients, lambda: fake(() => ({})) })).toThrow(/only with a nat-dns PROVIDER_BOUNDARY/)
+    expect(() => depsFromEnv({ ...env, PROVIDER_BOUNDARY: natDns, PROVIDER_DNS_SYNC_FUNCTION: 'llmar-provider-dns-sync' }, clients)).toThrow(/lambda client/)
+    expect(() => depsFromEnv({ ...env, PROVIDER_BOUNDARY: natDns, PROVIDER_DNS_SYNC_FUNCTION: 'bad name' }, { ...clients, lambda: fake(() => ({})) })).toThrow(/a function name/)
+  })
+  it('LambdaInvoker.invokeSync: RequestResponse; the result, or the function error\'s message', async () => {
+    const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o))
+    const ok = fake(() => ({ StatusCode: 200, Payload: enc({ outcome: 'synced', hosts: ['a.example.com'] }) }))
+    expect(await new LambdaInvoker(ok).invokeSync('f', { document: { version: 'v' } })).toEqual({ outcome: 'synced', hosts: ['a.example.com'] })
+    expect(ok.calls[0]).toMatchObject({ op: 'Invoke', input: { FunctionName: 'f', InvocationType: 'RequestResponse' } })
+    expect(JSON.parse(new TextDecoder().decode(ok.calls[0]!.input.Payload))).toEqual({ document: { version: 'v' } })
+    const bad = fake(() => ({ StatusCode: 200, FunctionError: 'Unhandled', Payload: enc({ errorType: 'Error', errorMessage: 'provider-dns-sync: the provider domain list is UPDATING, not COMPLETE' }) }))
+    await expect(new LambdaInvoker(bad).invokeSync('f', {})).rejects.toMatchObject({ name: 'FunctionError', message: /UPDATING, not COMPLETE/ })
+  })
+})
+
+describe('SecretsManagerKeyStore (ADR 0002: write-only provider keys)', () => {
+  const NAME = 'llmar/providers/litellm'
+  const at = new Date('2026-11-28T01:02:03.000Z')
+  it('absent: CreateSecret with the tags; present: PutSecretValue; scheduled for deletion: RestoreSecret first', async () => {
+    const absent = fake((op) => (op === 'DescribeSecret' ? err('ResourceNotFoundException') : {}))
+    await new SecretsManagerKeyStore(absent).put(NAME, 'k1', { 'llmar:prefix': 'llmar' })
+    expect(absent.calls.map((c) => c.op)).toEqual(['DescribeSecret', 'CreateSecret'])
+    expect(absent.calls[1]!.input).toEqual({ Name: NAME, SecretString: 'k1', Tags: [{ Key: 'llmar:prefix', Value: 'llmar' }] })
+    const present = fake((op) => (op === 'DescribeSecret' ? { LastChangedDate: at } : {}))
+    await new SecretsManagerKeyStore(present).put(NAME, 'k2', {})
+    expect(present.calls.map((c) => c.op)).toEqual(['DescribeSecret', 'PutSecretValue'])
+    expect(present.calls[1]!.input).toEqual({ SecretId: NAME, SecretString: 'k2' })
+    const deleted = fake((op) => (op === 'DescribeSecret' ? { DeletedDate: at } : {}))
+    await new SecretsManagerKeyStore(deleted).put(NAME, 'k3', {})
+    expect(deleted.calls.map((c) => c.op)).toEqual(['DescribeSecret', 'RestoreSecret', 'PutSecretValue'])
+    // Created concurrently: the value goes in as a new version.
+    const race = fake((op) => (op === 'DescribeSecret' ? err('ResourceNotFoundException') : op === 'CreateSecret' ? err('ResourceExistsException') : {}))
+    await new SecretsManagerKeyStore(race).put(NAME, 'k4', {})
+    expect(race.calls.map((c) => c.op)).toEqual(['DescribeSecret', 'CreateSecret', 'PutSecretValue'])
+  })
+  it('status from DescribeSecret (never GetSecretValue); delete schedules with the recovery window, once', async () => {
+    expect(await new SecretsManagerKeyStore(fake(() => ({ LastChangedDate: at }))).status(NAME)).toEqual({ updatedAt: at.toISOString() })
+    expect(await new SecretsManagerKeyStore(fake(() => ({ DeletedDate: at, LastChangedDate: at }))).status(NAME)).toBeUndefined()
+    expect(await new SecretsManagerKeyStore(fake(() => err('ResourceNotFoundException'))).status(NAME)).toBeUndefined()
+    await expect(new SecretsManagerKeyStore(fake(() => err('AccessDeniedException'))).status(NAME)).rejects.toThrow('AccessDeniedException')
+    const sm = fake((op) => (op === 'DescribeSecret' ? { LastChangedDate: at } : {}))
+    await new SecretsManagerKeyStore(sm).delete(NAME, 7)
+    expect(sm.calls).toEqual([{ op: 'DescribeSecret', input: { SecretId: NAME } }, { op: 'DeleteSecret', input: { SecretId: NAME, RecoveryWindowInDays: 7 } }])
+    const gone = fake((op) => (op === 'DescribeSecret' ? { DeletedDate: at } : {}))
+    await new SecretsManagerKeyStore(gone).delete(NAME, 7)
+    expect(gone.calls.map((c) => c.op)).toEqual(['DescribeSecret'])
+    for (const f of [sm, gone]) expect(f.calls.some((c) => c.op === 'GetSecretValue')).toBe(false)
   })
 })

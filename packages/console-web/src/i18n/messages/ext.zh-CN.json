@@ -210,5 +210,7 @@
   "ext.decision.assessor.prev": "本轮之前保留的意见",
   "ext.decision.assessor.prevMark": "来自 {ids}",
   "ext.decision.assessor.rulesVersion": "管理员规则版本",
-  "ext.decision.assessor.customMissing": "模型漏判的管理员规则"
+  "ext.decision.assessor.customMissing": "模型漏判的管理员规则",
+  "providers.boundary.mode.nat-dns": "NAT + DNS 防火墙（按 DNS 的主机名允许列表）",
+  "ext.error.providerDnsSyncFailed": "无法更新提供方的 DNS 允许列表，router 继续使用当前配置。请重试；如果一直失败，请让部署者检查 provider-dns-sync 函数。"
 }

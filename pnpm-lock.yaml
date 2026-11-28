@@ -79,6 +79,9 @@ importers:
       '@auto-router/pricing':
         specifier: workspace:*
         version: link:../pricing
+      '@aws-crypto/sha256-js':
+        specifier: 5.2.0
+        version: 5.2.0
       '@aws-sdk/client-bedrock':
         specifier: 3.1164.0
         version: 3.1164.0
@@ -94,6 +97,12 @@ importers:
       '@aws-sdk/client-s3':
         specifier: 3.1164.0
         version: 3.1164.0
+      '@smithy/protocol-http':
+        specifier: 5.6.2
+        version: 5.6.2
+      '@smithy/signature-v4':
+        specifier: 5.7.5
+        version: 5.7.5
 
   packages/console-api:
     dependencies:
@@ -131,6 +140,9 @@ importers:
         specifier: 3.1164.0
         version: 3.1164.0
       '@aws-sdk/client-s3':
+        specifier: 3.1164.0
+        version: 3.1164.0
+      '@aws-sdk/client-secrets-manager':
         specifier: 3.1164.0
         version: 3.1164.0
 
@@ -351,6 +363,10 @@ packages:
 
   '@aws-sdk/client-s3@3.1164.0':
     resolution: {integrity: sha512-RCzGDlPFT0vH+rTIW+ukSsdeTC4RuFPDDvTracNW40CES6twgv7OXBXR1oVkhO3u7qY4UECbjF/kJmTSNx7eWQ==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/client-secrets-manager@3.1164.0':
+    resolution: {integrity: sha512-c1FFvJdhZLVLznVccXQ0/YVDQIjF0azsqiQz8XhZ2FDW/vfPr/UnLjMY34ZUVABPbk7HD8N+7GRVhhJ7ddVCAg==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.979.1':
@@ -1685,6 +1701,17 @@ snapshots:
       '@aws-sdk/credential-provider-node': 3.972.94
       '@aws-sdk/middleware-sdk-s3': 3.972.87
       '@aws-sdk/signature-v4-multi-region': 3.996.51
+      '@aws-sdk/types': 3.975.0
+      '@smithy/core': 3.38.1
+      '@smithy/fetch-http-handler': 5.8.0
+      '@smithy/node-http-handler': 4.14.1
+      '@smithy/types': 4.19.0
+      tslib: 2.9.1
+
+  '@aws-sdk/client-secrets-manager@3.1164.0':
+    dependencies:
+      '@aws-sdk/core': 3.980.1
+      '@aws-sdk/credential-provider-node': 3.972.94
       '@aws-sdk/types': 3.975.0
       '@smithy/core': 3.38.1
       '@smithy/fetch-http-handler': 5.8.0

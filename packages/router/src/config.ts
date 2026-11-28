@@ -2,10 +2,14 @@
 import { readFileSync } from 'node:fs'
 import { checkPolicyAgainstCatalog, validatePolicy, type Policy, type Tier } from '@auto-router/core'
 import { DEFAULT_ASSESSOR_MODEL, defaultPackName, loadBundledPacks, manifestMismatches, PRESET_CUSTOM_RULES, readManifest, selectAdapter, type BundledPack, type PackName } from '@auto-router/assessor'
-import { findModel, loadCatalog, validateCatalog, type ModelPrice, type PriceCatalog } from '@auto-router/pricing'
+import {
+  BEDROCK_PROVIDER, findModel, loadCatalog, managedSecretName, mergeRegistry, providerOf, validateBoundary, validateCatalog, validateRegistry,
+  type EgressBoundary, type ModelPrice, type PriceCatalog, type ProviderRegistry,
+} from '@auto-router/pricing'
 import type { RouterAssessorConfig } from './assessor.ts'
 import { IDENTITY_HEADERS, IDENTITY_MODES, type IdentityHeader, type IdentityMode } from './identity.ts'
 import { allowedModels } from './models.ts'
+import { registryIssues } from './providers.ts'
 import type { CatalogSource } from './runtime.ts'
 import { validateAssessorSettings, type PackInfo, type SettingsField } from './settings.ts'
 
@@ -35,6 +39,23 @@ export interface RouterConfig {
   catalog: PriceCatalog
   /** Where `catalog` came from; absent (hand-built configs) = 'bundled'. */
   catalogSource?: CatalogSource
+  /**
+   * ROUTER_PROVIDERS_JSON | ROUTER_PROVIDERS_FILE (11-28 external providers): the provider registry, validated and
+   * checked against this router (providers.ts registryIssues). Every generation's catalog is
+   * mergeRegistry(<Bedrock catalog>, providers). Absent: Bedrock only.
+   */
+  providers?: ProviderRegistry
+  /**
+   * ROUTER_PROVIDER_BOUNDARY (JSON EgressBoundary, validateBoundary; ADR 0002): where a configuration document's
+   * providers section may send requests. loadConfig always sets it (unset: mode none, so no section may name a
+   * provider); absent in hand-built configs means the same.
+   */
+  providerBoundary?: EgressBoundary
+  /**
+   * ROUTER_SECRET_PREFIX: the deployment prefix of console-managed provider keys (Secrets Manager
+   * `<prefix>/providers/<id>`). Absent: a provider with a managed secret answers 502 upstream-secret.
+   */
+  secretPrefix?: string
   fault: Fault
   /** Per upstream attempt: time to response headers (stream / non-stream) and the idle gap allowed between body chunks. */
   timeouts: Timeouts
@@ -149,7 +170,9 @@ function hints(raw: string | undefined, issues: string[]): Hints {
  * ROUTER_FAULT_INJECT + ROUTER_FAULT_INJECT_ALLOW=1, ROUTER_{STREAM,NONSTREAM}_HEADER_TIMEOUT_MS, ROUTER_STREAM_IDLE_TIMEOUT_MS,
  * ROUTER_ASSESSOR_{MODE,MODEL,THRESHOLD,PACK,TIMEOUT_MS,AUTO_RULES} (see assessorSettings), ROUTER_ASSESSOR_HOLD_TIERS
  * (see holdTiersOf), ROUTER_MODEL_UNIVERSE,
- * ROUTER_CONFIG_BUCKET, ROUTER_CONFIG_POLL_MS, ROUTER_STATE_TABLE, ROUTER_SHUTDOWN_GRACE_MS.
+ * ROUTER_CONFIG_BUCKET, ROUTER_CONFIG_POLL_MS, ROUTER_STATE_TABLE, ROUTER_SHUTDOWN_GRACE_MS,
+ * ROUTER_PROVIDERS_JSON | ROUTER_PROVIDERS_FILE (provider registry; env: secrets are read from `env`),
+ * ROUTER_PROVIDER_BOUNDARY (JSON egress boundary), ROUTER_SECRET_PREFIX (managed provider keys).
  */
 export function loadConfig(env: NodeJS.ProcessEnv, readFile: (p: string) => string = (p) => readFileSync(p, 'utf8'),
   opts: { bucketCatalog?: PriceCatalog } = {}): RouterConfig {
@@ -238,9 +261,37 @@ export function loadConfig(env: NodeJS.ProcessEnv, readFile: (p: string) => stri
   } catch (e) {
     issues.push(`catalog: ${(e as Error).message}`)
   }
+  // Provider registry (11-28): validated, then checked against this router (secrets, Region, timeouts).
+  let providers: ProviderRegistry | undefined
+  try {
+    const raw = env.ROUTER_PROVIDERS_JSON ?? (env.ROUTER_PROVIDERS_FILE ? readFile(env.ROUTER_PROVIDERS_FILE) : undefined)
+    if (raw !== undefined) {
+      providers = validateRegistry(JSON.parse(raw))
+      issues.push(...registryIssues(providers, env, region, timeouts, env.ROUTER_INBOUND_TEST_BYPASS !== '1'))
+    }
+  } catch (e) {
+    issues.push(`ROUTER_PROVIDERS_FILE/JSON: ${(e as Error).message}`)
+  }
+  // Console-managed providers (11-28-console-providers §2.3): the egress boundary a providers section is checked
+  // against, and the prefix of the keys the console writes. Messages never echo the values.
+  let providerBoundary: EgressBoundary = { mode: 'none', hosts: [], cidrs: [] }
+  if (env.ROUTER_PROVIDER_BOUNDARY) {
+    try { providerBoundary = validateBoundary(JSON.parse(env.ROUTER_PROVIDER_BOUNDARY)) } catch (e) {
+      issues.push(`ROUTER_PROVIDER_BOUNDARY: ${e instanceof SyntaxError ? 'JSON object required' : (e as Error).message}`)
+    }
+  }
+  const secretPrefix = env.ROUTER_SECRET_PREFIX || undefined
+  if (secretPrefix !== undefined) {
+    try { managedSecretName(secretPrefix, 'x') } catch { issues.push('ROUTER_SECRET_PREFIX: a Secrets Manager name prefix (letters, digits, /_+=.@-; no trailing /) required') }
+  }
+  // The effective catalog (Bedrock ∪ registry models) is what policies, pins and the assessor see.
+  let effective: PriceCatalog | undefined = catalog
+  if (catalog && providers) {
+    try { effective = mergeRegistry(catalog, providers) } catch (e) { issues.push(`ROUTER_PROVIDERS_FILE/JSON: ${(e as Error).message}`); effective = undefined }
+  }
   // Every pool, failover and observe-default model must exist in this region's catalog (core's own check).
-  if (policy && catalog) {
-    try { checkPolicyAgainstCatalog(policy, catalog) } catch (e) { issues.push(`policy vs ${region} catalog: ${(e as Error).message}`) }
+  if (policy && effective) {
+    try { checkPolicyAgainstCatalog(policy, effective) } catch (e) { issues.push(`policy vs ${region} catalog: ${(e as Error).message}`) }
   }
 
   const h = hints(env.ROUTER_HINTS, issues)
@@ -255,10 +306,11 @@ export function loadConfig(env: NodeJS.ProcessEnv, readFile: (p: string) => stri
     // against the catalog) and stays in the decision bound only for lineages an earlier generation locked to it.
     if (catalog && catalogSource !== 'bucket') for (const m of modelUniverse) if (!findModel(catalog, m)) issues.push(`ROUTER_MODEL_UNIVERSE: '${m}' is not in the ${catalog.region} catalog`)
   }
-  const assessor = assessorSettings(env, policy, catalog, packs, issues, modelUniverse)
+  const assessor = assessorSettings(env, policy, effective, packs, issues, modelUniverse)
   const assessorHoldTiers = holdTiersOf(env.ROUTER_ASSESSOR_HOLD_TIERS, issues)
-  if (modelUniverse && policy && catalog) {
-    const missing = [...allowedModels(policy, catalog)].filter((m) => !modelUniverse?.has(m))
+  if (modelUniverse && policy && effective) {
+    // The universe is the Bedrock IAM grant: registry models are never in it (they are allowed by the registry).
+    const missing = [...allowedModels(policy, effective)].filter((m) => providerOf(m) === BEDROCK_PROVIDER && !modelUniverse?.has(m))
     if (missing.length) issues.push(`ROUTER_MODEL_UNIVERSE: must include the boot policy's models (missing ${missing.join(', ')})`)
   }
   let configSource: RouterConfig['configSource']
@@ -275,7 +327,8 @@ export function loadConfig(env: NodeJS.ProcessEnv, readFile: (p: string) => stri
   const shutdownGraceMs = int(env, 'ROUTER_SHUTDOWN_GRACE_MS', DEFAULT_SHUTDOWN_GRACE_MS, issues, 0)
   if (shutdownGraceMs > timeouts.streamCapMs) issues.push(`ROUTER_SHUTDOWN_GRACE_MS: at most ROUTER_STREAM_CAP_MS (${timeouts.streamCapMs})`)
   if (issues.length || !policy || !catalog) throw new ConfigError(issues)
-  return { bind, port, maxBodyBytes, region, upstream, hopAuth, hints: h, policy, catalog, catalogSource, fault, timeouts, assessor, packs,
+  return { bind, port, maxBodyBytes, region, upstream, hopAuth, hints: h, policy, catalog, catalogSource, ...(providers ? { providers } : {}),
+    providerBoundary, ...(secretPrefix !== undefined ? { secretPrefix } : {}), fault, timeouts, assessor, packs,
     ...(modelUniverse ? { modelUniverse } : {}), ...(configSource ? { configSource } : {}), ...(identity ? { identity } : {}),
     ...(stateTable !== undefined ? { stateTable } : {}), ...(assessorHoldTiers ? { assessorHoldTiers } : {}), shutdownGraceMs }
 }
@@ -361,8 +414,14 @@ export function packInfos(packs: ReadonlyMap<PackName, BundledPack>): PackInfo[]
   return [...packs.values()].map((b) => ({ name: b.name, packVersion: b.packVersion, autoCapable: b.pack.rules.some((r) => r.enabled && r.auto) }))
 }
 
-/** The assessor has an adapter for this model (validateAssessorSettings' hasAdapter). */
-export const hasAssessorAdapter = (price: ModelPrice): boolean => { try { selectAdapter(price); return true } catch { return false } }
+/**
+ * The assessor has an adapter for this model (validateAssessorSettings' hasAdapter). Bedrock models only: the assessor
+ * calls bedrock-runtime (11-28 external providers: assessor v1 uses Bedrock models), so a registry model has none.
+ */
+export const hasAssessorAdapter = (price: ModelPrice): boolean => {
+  if ((price.provider ?? BEDROCK_PROVIDER) !== BEDROCK_PROVIDER) return false
+  try { selectAdapter(price); return true } catch { return false }
+}
 
 const ENV_OF: Record<SettingsField, string> = {
   mode: 'ROUTER_ASSESSOR_MODE', pack: 'ROUTER_ASSESSOR_PACK', packVersion: 'ROUTER_ASSESSOR_PACK_VERSION', model: 'ROUTER_ASSESSOR_MODEL',

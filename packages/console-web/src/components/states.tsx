@@ -44,7 +44,8 @@ export type NotFoundAs = 'not-found' | 'config' | 'error'
 /** Flash text for a failed config mutation: 503 config-unavailable has its own copy (validate and activate send it). */
 export function useMutationErrorText(): (e: unknown) => string {
   const { t } = useI18n()
-  return (e) => (e instanceof ApiError && e.code === 'config-unavailable' ? t('ext.state.configUnavailable') : t('state.error.title'))
+  return (e) => (e instanceof ApiError && e.code === 'config-unavailable' ? t('ext.state.configUnavailable')
+    : e instanceof ApiError && e.code === 'provider-dns-sync-failed' ? t('ext.error.providerDnsSyncFailed') : t('state.error.title'))
 }
 
 /** Renders an API error as the matching state; `inline` for card-level errors (the page still renders). */

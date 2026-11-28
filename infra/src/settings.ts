@@ -1,5 +1,6 @@
 // Deploy-time settings (parent PRD N5, publishable): nothing about a particular deployment is baked into code.
 // Every value comes from CDK context (-c key=value) or the environment; required ones fail fast at synth.
+import { ANY_HOST, hostPatternsIssue } from '@auto-router/pricing'
 import type { Node } from 'constructs'
 
 /**
@@ -24,6 +25,38 @@ export interface Settings {
   tags: Record<string, string>
   policyFile: string
   catalogFile?: string
+  /**
+   * -c providersFile=<path>: the provider registry (providers other than Bedrock; design 11-28 §3, ADR 0001). Checked in
+   * deployModels; the router gets it as ROUTER_PROVIDERS_JSON and the config bucket gets providers/versions/<v>.json.
+   */
+  providersFile?: string
+  /**
+   * -c providerEgress=<cidr>[:<port>],...: router security-group egress to private provider endpoints (peering, PrivateLink,
+   * a VPN). Routes and DNS for those endpoints are the deployer's own. Port defaults to 443. Absent = no extra egress.
+   */
+  providerEgress?: { cidr: string; port: number }[]
+  /**
+   * -c providerEgressMode: how the router reaches the registry's endpoints (design 11-28 §5, ADR 0001). Required with a
+   * providersFile; absent without one (no provider egress, as before).
+   * - private: only the providerEgress CIDRs (peering, PrivateLink, VPN); the VPC keeps no internet path.
+   * - firewall: NAT gateway behind an AWS Network Firewall that passes TLS on 443 to the registry's hostnames only
+   *   (egress.ts); needs providerEgressAzs.
+   * - nat-dns: NAT gateway with a Route 53 Resolver DNS Firewall on the VPC that resolves only the registry's hostnames
+   *   and AWS service names (egress.ts, ADR 0003); cheaper than firewall, bypassable by a client that skips DNS. Needs
+   *   providerEgressAzs.
+   * - bring-your-own: router egress 443 to 0.0.0.0/0 (or the providerEgress CIDRs); the route and any filtering are the
+   *   deployer's. Needs providerEgressAck=unfiltered.
+   */
+  providerEgressMode?: 'private' | 'firewall' | 'nat-dns' | 'bring-your-own'
+  /**
+   * -c providerHosts=<pattern>,...: the egress boundary's hostnames (ADR 0002): exact `api.example.com` or `*.example.com`,
+   * or `*` alone (any host: nat-dns and bring-your-own only, ADR 0003). The ceiling of what may ever be reached:
+   * firewall allowlists it with the providersFile's hosts; nat-dns resolves the configured providers' hosts inside it;
+   * bring-your-own: console providers must match it when given. Admins add providers in the console only inside it.
+   */
+  providerHosts?: string[]
+  /** -c providerEgressAzs=1|2 (firewall and nat-dns only, no default): NAT gateways (and firewall endpoints) in one or both AZs. */
+  providerEgressAzs?: 1 | 2
   /**
    * allowedModelUniverse: the models the router task role may invoke, so the console can put them in a policy.
    * 'policy' (default) = the policy file's models; 'catalog' = every model in the region catalog; a list = the policy
@@ -137,7 +170,8 @@ export function resolveCommon(str: (k: string) => string | undefined, env: NodeJ
 }
 
 /**
- * Router stack context keys: the common ones (resolveCommon), azIds (comma list), policyFile, catalogFile,
+ * Router stack context keys: the common ones (resolveCommon), azIds (comma list), policyFile, catalogFile, providersFile,
+ * providerEgress (comma list of <cidr>[:<port>]), providerEgressMode, providerEgressAzs, providerEgressAck, providerHosts,
  * allowedModelUniverse (policy | catalog | comma list of model ids, default policy),
  * routerDesiredCount, routerAutoscale ('<min>,<max>'), routerScaleCpu (percent, default 60), stateStore (memory | dynamodb, default memory), throttle ('<rate>,<burst>'), e2eFault, e2eIdleTimeoutMs, identity (identityMode, cliRedirectPorts,
  * codexOauthPort, cliRefreshDays), and the tier assessor: assessorMode
@@ -205,13 +239,22 @@ export function resolveSettings(node: Ctx, env: NodeJS.ProcessEnv, defaultPolicy
   }
   const identity = identityDeploy(str, issues)
   const modelUniverse = modelUniverseDeploy(str('allowedModelUniverse'), issues)
+  const providerEgress = providerEgressDeploy(str('providerEgress'), issues)
+  const egressMode = providerEgressModeDeploy(str, issues)
+  const providerHosts = providerHostsDeploy(str('providerHosts'), egressMode.mode, issues)
 
   if (issues.length) throw new SettingsError(issues)
   const catalogFile = str('catalogFile')
+  const providersFile = str('providersFile')
   return {
     region, account, azIds: [azIds[0] as string, azIds[1] as string], prefix, tags,
     policyFile: str('policyFile') ?? env.ROUTER_POLICY_FILE ?? defaultPolicyFile,
     ...(catalogFile ? { catalogFile } : {}),
+    ...(providersFile ? { providersFile } : {}),
+    ...(providerEgress.length ? { providerEgress } : {}),
+    ...(egressMode.mode ? { providerEgressMode: egressMode.mode } : {}),
+    ...(egressMode.azs ? { providerEgressAzs: egressMode.azs } : {}),
+    ...(providerHosts.length ? { providerHosts } : {}),
     modelUniverse,
     desiredCount,
     ...(autoscale ? { autoscale } : {}),
@@ -242,6 +285,64 @@ function identityDeploy(str: (k: string) => string | undefined, issues: string[]
   const days = Number(str('cliRefreshDays') ?? '30')
   if (!Number.isInteger(days) || days < 1 || days > 3650) issues.push('cliRefreshDays: integer 1..3650')
   return { mode: mode as Settings['identity']['mode'], cliRedirectPorts: [...new Set(cliRedirectPorts)], codexOauthPort, cliRefreshDays: days }
+}
+
+const CIDR_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
+
+/** providerEgress: comma list of IPv4 <cidr>[:<port>] (default port 443); never 0.0.0.0/0 (public egress is P2). */
+function providerEgressDeploy(raw: string | undefined, issues: string[]): { cidr: string; port: number }[] {
+  if (raw === undefined || raw.trim() === '') return []
+  const out: { cidr: string; port: number }[] = []
+  for (const item of raw.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const [cidr = '', p] = item.split(':')
+    const m = CIDR_RE.exec(cidr)
+    const port = p === undefined ? 443 : Number(p)
+    if (!m || m.slice(1, 5).some((o) => Number(o) > 255) || Number(m[5]) > 32) { issues.push(`providerEgress: '${item}' is not an IPv4 <cidr>[:<port>]`); continue }
+    if (Number(m[5]) < 8) { issues.push(`providerEgress: '${cidr}' is wider than /8 (internet egress is not supported)`); continue }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) { issues.push(`providerEgress: '${item}' has a bad port`); continue }
+    out.push({ cidr, port })
+  }
+  return out
+}
+
+const EGRESS_MODES = ['private', 'firewall', 'nat-dns', 'bring-your-own'] as const
+/** Modes with a NAT gateway built by this stack, and a hostname allowlist (providerHosts + the registry's hostnames). */
+export const NAT_EGRESS_MODES: readonly NonNullable<Settings['providerEgressMode']>[] = ['firewall', 'nat-dns']
+const natMode = (m: string | undefined): boolean => (NAT_EGRESS_MODES as readonly (string | undefined)[]).includes(m)
+
+/**
+ * providerEgressMode (private | firewall | nat-dns | bring-your-own), providerEgressAzs (1 | 2: firewall and nat-dns only, required there) and
+ * providerEgressAck (unfiltered: bring-your-own only, required there). A flag outside its mode is refused.
+ */
+/**
+ * providerHosts: comma list of lowercase hostname patterns (HOST_PATTERN), firewall, nat-dns or bring-your-own only;
+ * `*` (any host) alone, and not with firewall (its rules match each host's TLS SNI).
+ */
+function providerHostsDeploy(raw: string | undefined, mode: Settings['providerEgressMode'], issues: string[]): string[] {
+  if (raw === undefined || raw.trim() === '') return []
+  if (!natMode(mode) && mode !== 'bring-your-own') { issues.push('providerHosts: only with providerEgressMode=firewall, nat-dns or bring-your-own'); return [] }
+  const hosts = [...new Set(raw.split(',').map((h) => h.trim().toLowerCase()).filter(Boolean))].sort()
+  const issue = hostPatternsIssue(hosts)
+  if (issue) { issues.push(`providerHosts: ${issue}`); return [] }
+  if (mode === 'firewall' && hosts.includes(ANY_HOST)) { issues.push(`providerHosts: '${ANY_HOST}' (any host) needs providerEgressMode=nat-dns or bring-your-own; the firewall matches each host's TLS SNI`); return [] }
+  return hosts
+}
+
+function providerEgressModeDeploy(str: (k: string) => string | undefined, issues: string[]): { mode?: Settings['providerEgressMode']; azs?: 1 | 2 } {
+  const mode = str('providerEgressMode')
+  const azs = str('providerEgressAzs')
+  const ack = str('providerEgressAck')
+  if (mode !== undefined && !(EGRESS_MODES as readonly string[]).includes(mode)) {
+    issues.push(`providerEgressMode: ${EGRESS_MODES.join(' | ')}, got '${mode}'`)
+    return {}
+  }
+  if (natMode(mode)) {
+    if (azs !== '1' && azs !== '2') issues.push(`providerEgressAzs: 1 or 2 required with providerEgressMode=${mode} (NAT gateways${mode === 'firewall' ? ' and firewall endpoints' : ''} per AZ: cost vs. AZ independence, see infra/README.md), got '${azs ?? ''}'`)
+  } else if (azs !== undefined) issues.push('providerEgressAzs: only with providerEgressMode=firewall or nat-dns')
+  if (mode === 'bring-your-own') {
+    if (ack !== 'unfiltered') issues.push(`providerEgressAck: providerEgressMode=bring-your-own opens router egress the stack does not filter; acknowledge with -c providerEgressAck=unfiltered`)
+  } else if (ack !== undefined) issues.push('providerEgressAck: only with providerEgressMode=bring-your-own')
+  return { ...(mode ? { mode: mode as Settings['providerEgressMode'] } : {}), ...(natMode(mode) && (azs === '1' || azs === '2') ? { azs: Number(azs) as 1 | 2 } : {}) }
 }
 
 const MODEL_ID_RE = /^[a-z0-9][a-z0-9.:-]{2,127}$/

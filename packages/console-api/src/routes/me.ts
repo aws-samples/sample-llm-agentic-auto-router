@@ -10,6 +10,7 @@ import type { ConfigDocument } from '../local-types.ts'
 import type { Deps, MemberSettings } from '../ports.ts'
 import type { Ctx, Handler } from '../app.ts'
 import { catalogRef } from '../catalog.ts'
+import { routingCatalog } from '../providers.ts'
 import { effectiveConfig } from '../effective.ts'
 import { audit, monthOf, nanoToUsd, reqIdOf, SESSION_LABEL, tsOf } from './common.ts'
 import { archivedPack, PACK_VERSION } from './packs.ts'
@@ -62,7 +63,7 @@ export function poolViews(deps: Deps, policy: PolicyView, cap: Cap | undefined):
   return Object.entries(policy.pools ?? {}).map(([dialect, pool]) => {
     const byTier = new Map<Tier, string[]>()
     for (const e of pool.models ?? []) {
-      const tier = (e.tier ?? deps.catalog.models.find((m) => m.modelId === e.model)?.tier) as Tier | undefined
+      const tier = (e.tier ?? routingCatalog(deps).models.find((m) => m.modelId === e.model)?.tier) as Tier | undefined
       if (!tier || (TIER_RANK[tier] > max && !pins.has(e.model))) continue
       byTier.set(tier, [...(byTier.get(tier) ?? []), e.model])
     }

@@ -210,5 +210,7 @@
   "ext.decision.assessor.prev": "Held opinion before this turn",
   "ext.decision.assessor.prevMark": "from {ids}",
   "ext.decision.assessor.rulesVersion": "Admin rules version",
-  "ext.decision.assessor.customMissing": "Admin rules the model did not judge"
+  "ext.decision.assessor.customMissing": "Admin rules the model did not judge",
+  "providers.boundary.mode.nat-dns": "NAT + DNS firewall (hostname allowlist by DNS)",
+  "ext.error.providerDnsSyncFailed": "The DNS allow list for providers could not be updated, so the router keeps its current configuration. Try again; if it keeps failing, ask the deployer to check the provider-dns-sync function."
 }

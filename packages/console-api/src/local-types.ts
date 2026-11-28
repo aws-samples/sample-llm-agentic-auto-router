@@ -4,7 +4,8 @@
 import type { ConfigDocument, ConfigVersionMeta, ErrorCode, ValidationIssue } from '@auto-router/console-contract'
 
 export type { ConfigDocument }
-export const CONFIG_SECTIONS = ['policy', 'assessor', 'identity', 'access'] as const
+/** Every top-level section of a config document; `providers` (ADR 0002) is optional (absent = the deploy-time registry). */
+export const CONFIG_SECTIONS = ['policy', 'assessor', 'identity', 'access', 'providers'] as const
 export interface StoredVersion { meta: ConfigVersionMeta; document: ConfigDocument }
 export type Issue = ValidationIssue
 export type ApiErrorCode = ErrorCode

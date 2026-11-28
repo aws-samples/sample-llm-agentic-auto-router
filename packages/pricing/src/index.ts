@@ -15,7 +15,15 @@ export { catalogRegions, findModel, loadCatalog, PRICED_SERVICE_TIERS, REFERENCE
 export { costOf, defaultServiceTier, pricingTier, requestedServiceTier, tierPrice } from './cost.ts'
 export { CatalogError, PricingError, UsageNotFoundError } from './errors.ts'
 export { parseSse, type SseEvent } from './sse.ts'
-export { createStreamUsageAccumulator, normalizeUsage, OPENAI_DEFAULT_WRITE_TTL } from './usage.ts'
+export {
+  BEDROCK_PROVIDER, mergeRegistry, PROVIDER_ID_PATTERN, providerKeys, providerOf, REGISTRY_VERSION_PATTERN, splitModelId, validateRegistry,
+  type ProviderDef, type ProviderModel, type ProviderRegistry, type UsageQuirks,
+} from './providers.ts'
+export {
+  ANY_HOST, EGRESS_MODES, HOST_PATTERN, hostAllowed, hostPatternsIssue, managedSecretName, providerDnsHosts, providersIssues, validateBoundary,
+  type EgressBoundary, type EgressMode, type ProvidersIssueOptions, type ProvidersSection,
+} from './boundary.ts'
+export { createStreamUsageAccumulator, normalizeUsage, OPENAI_DEFAULT_WRITE_TTL, type UsageOptions } from './usage.ts'
 
 // Dynamic catalog building blocks (docs/tasks/11-16-dynamic-catalog). Pure: no AWS SDK, no I/O.
 export { TIER_MULTIPLIERS, usageKey } from './build.ts'

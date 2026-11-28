@@ -2,7 +2,9 @@
 // activation is a new immutable version: one DynamoDB transaction writes the version and moves ACTIVE (conditional on
 // the editor's baseVersion), then the document is delivered to S3 (`config/versions/<n>.json`, then
 // `config/active.json`), where the router polls it. A failed delivery leaves ACTIVE undelivered; POST
-// config/redeliver repeats it.
+// config/redeliver repeats it. With nat-dns (ADR 0003) the DNS Firewall provider list is synced to the document
+// before config/active.json is written: before the transaction on activation (a failure activates nothing), and in
+// every delivery of a version not synced yet (a failure leaves it undelivered).
 import type { ActivateResponse, ConfigState, ConfigVersionMeta, Page, RouterConfigState, SwapEffect, ValidateResponse } from '@auto-router/console-contract'
 import { policySwapEffects, validatePolicy } from '@auto-router/core/policy'
 import { hasAssessorAdapter } from '@auto-router/router'
@@ -15,6 +17,8 @@ import { audit, iso, stringField } from './common.ts'
 import { BAKED_VERSION, effectiveConfig, freshStates, identityKeys, identityKeysMessage, reportedConfigs } from '../effective.ts'
 import { packInfo, runningPacks } from './packs.ts'
 import { catalogRef } from '../catalog.ts'
+import { mergeRegistry, type ProviderRegistry } from '@auto-router/pricing'
+import { boundaryOf, documentRegistry, registryModelIds, registryObject, routingCatalog } from '../providers.ts'
 
 const ACTIVE_KEY = 'config/active.json'
 export const versionKey = (n: number) => `config/versions/${n}.json`
@@ -40,7 +44,11 @@ export async function activeDocument(deps: Deps): Promise<ConfigDocument | undef
 
 export async function validateDraft(deps: Deps, raw: unknown): Promise<DocResult> {
   const running = await runningPacks(deps)
-  const r = validateConfigDocument(raw, { catalog: deps.catalog, packs: running.packs.map(packInfo), universe: new Set(deps.env.modelUniverse), hasAdapter: hasAssessorAdapter })
+  const baked = deps.routing?.baked
+  const r = validateConfigDocument(raw, {
+    catalog: deps.catalog, packs: running.packs.map(packInfo), universe: new Set(deps.env.modelUniverse), hasAdapter: hasAssessorAdapter,
+    boundary: boundaryOf(deps), ...(baked ? { bakedRegistry: baked } : {}),
+  })
   r.warnings.push(...running.warnings)
   return r
 }
@@ -67,15 +75,49 @@ async function configRouterState(deps: Deps, active: StoredVersion): Promise<Rou
 
 
 /**
- * Writes the ACTIVE version's document to S3 and marks it delivered. If ACTIVE moved while writing (a concurrent
- * activation), delivers the newer one too, so config/active.json never ends on an older version.
+ * nat-dns (ADR 0003): replaces the DNS Firewall provider list with the hosts of `document`'s providers (the baked
+ * ones when it has no providers section), or of config/active.json when `document` is null. Synchronous: resolves once
+ * the list is in effect. No-op without the function (other egress modes). Throws HttpError 502 provider-dns-sync-failed.
  */
-export async function deliver(deps: Deps): Promise<{ n: number; delivered: boolean }> {
+export async function syncProviderDns(deps: Deps, document: ConfigDocument | null): Promise<void> {
+  const fn = deps.env.providerDnsSyncFunction
+  if (!fn) return
+  try {
+    if (!deps.invoker) throw Object.assign(new Error('no function invoker'), { name: 'NoInvoker' })
+    await deps.invoker.invokeSync(fn, document ? { document } : {})
+  } catch (e) {
+    const name = e instanceof Error ? e.name : 'unknown'
+    deps.log({ kind: 'console-api-provider-dns-sync-failed', error: name, ...(document ? { version: document.version } : {}) })
+    throw new HttpError(502, 'provider-dns-sync-failed', `the DNS Firewall provider allow list could not be updated (${e instanceof Error ? e.message.slice(0, 200) : name})`)
+  }
+}
+
+/** syncProviderDns from config/active.json (what the router runs), after an activation that wrote nothing; logged, never thrown. */
+async function resyncProviderDns(deps: Deps): Promise<void> {
+  try { await syncProviderDns(deps, null) } catch { /* logged by syncProviderDns; the next activation or deploy re-syncs */ }
+}
+
+/**
+ * Writes the ACTIVE version's document to S3 and marks it delivered. If ACTIVE moved while writing (a concurrent
+ * activation), delivers the newer one too, so config/active.json never ends on an older version. With nat-dns the
+ * provider list is synced to each version first, except `dnsSynced` (the activation synced it already).
+ */
+export async function deliver(deps: Deps, opts: { dnsSynced?: number } = {}): Promise<{ n: number; delivered: boolean; dnsSyncFailed?: true }> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const v = await activeVersion(deps)
     // The baked configuration is the router's own boot document: never written to config/active.json.
     if (v.meta.n === 0) return { n: 0, delivered: true }
+    if (v.meta.n !== opts.dnsSynced) {
+      try { await syncProviderDns(deps, v.document) } catch {
+        await deps.console.markDelivered(v.meta.n, false)
+        return { n: v.meta.n, delivered: false, dnsSyncFailed: true }
+      }
+    }
     try {
+      // The document's registry first (ADR 0002): ingest prices records of catalog `<c>+<version>` from
+      // providers/versions/<version>.json. Immutable: written once, never overwritten (an existing one is this one).
+      const reg = registryObject(v.document)
+      if (reg) await deps.objects.putIf(reg.key, reg.body, { ifNoneMatch: '*' })
       const body = `${JSON.stringify(v.document)}\n`
       await deps.objects.put(versionKey(v.meta.n), body)
       await deps.objects.put(ACTIVE_KEY, body)
@@ -119,8 +161,23 @@ function effectsOf(deps: Deps, prev: ConfigDocument | undefined, next: ConfigDoc
   return [...policyEffects(deps, prev, next), ...consoleEffects(prev, next, baked)]
 }
 
+/**
+ * The catalog both sides' models are priced in: the catalog in force plus next's registry and prev's providers next
+ * drops (ADR 0002: a provider and the pools that use it change together). The routing catalog when that cannot merge.
+ */
+function effectsCatalog(deps: Deps, prev: ConfigDocument, next: ConfigDocument) {
+  const baked = deps.routing?.baked
+  const a = documentRegistry(prev, baked)
+  const b = documentRegistry(next, baked)
+  if (!a && !b) return deps.catalog
+  const ids = new Set((b?.providers ?? []).map((p) => p.id))
+  const both: ProviderRegistry = { schemaVersion: 1, version: b?.version ?? a?.version ?? 'effects', providers: [...(b?.providers ?? []), ...(a?.providers ?? []).filter((p) => !ids.has(p.id))] }
+  try { return mergeRegistry(deps.catalog, both) } catch { return routingCatalog(deps) }
+}
+
 function policyEffects(deps: Deps, prev: ConfigDocument, next: ConfigDocument): SwapEffect[] {
-  if (deps.swapEffects) return deps.swapEffects(prev, next, deps.catalog)
+  const catalog = effectsCatalog(deps, prev, next)
+  if (deps.swapEffects) return deps.swapEffects(prev, next, catalog)
   let before
   // The active document was accepted by the core of its time: unknown keys do not make it incomparable.
   try { before = validatePolicy(prev.policy, { unknownKeys: 'ignore' }) } catch {
@@ -128,7 +185,7 @@ function policyEffects(deps: Deps, prev: ConfigDocument, next: ConfigDocument): 
     // must confirm the swap explicitly (0d review).
     return [{ effect: 'cannot-compare', severity: 'disruptive', detail: 'the active policy no longer validates against this console; the effects of the swap cannot be computed' }]
   }
-  return policySwapEffects(before, validatePolicy(next.policy), deps.catalog)
+  return policySwapEffects(before, validatePolicy(next.policy), catalog)
 }
 
 function failValidation(r: Extract<DocResult, { ok: false }>): never {
@@ -184,20 +241,28 @@ const activate: Handler = async (ctx) => {
     meta: { version, n, author: ctx.caller.key, createdAt: iso(nowMs), comment, changed: changedSections(prevDoc, document), ...(rollbackOf ? { rollbackOf } : {}) },
     document,
   }
+  // nat-dns: the provider list first, so the router never runs a provider whose host does not resolve; a failure
+  // activates nothing (config and allow list always agree).
+  await syncProviderDns(deps, document)
   if ((await deps.console.activate(v, pointer?.version)) === 'conflict') {
+    await resyncProviderDns(deps)
     throw new HttpError(409, 'config-version-moved', 'another version was activated at the same time; review it first')
   }
   await deps.console.deleteDraft()
-  const d = await deliver(deps)
+  const d = await deliver(deps, { dnsSynced: n })
   const delivered = d.delivered && d.n === n
+  // Not delivered: the router still runs config/active.json, so the list goes back to it.
+  if (!delivered) await resyncProviderDns(deps)
   await audit(ctx, {
     action: rollbackOf ? 'config.rollback' : 'config.activate', target: `config:${version}`,
     summary: `${rollbackOf ? `roll back to ${rollbackOf}` : 'activate'}: ${v.meta.changed.join(', ') || 'no change'}; ${comment}`,
     before: { version: active.meta.version, identity: prevDoc.identity?.mode, assessor: prevDoc.assessor?.mode },
     after: { version, changed: v.meta.changed, identity: (r.document.identity ?? eff.baked?.identity)?.mode, assessor: (r.document.assessor ?? eff.baked?.assessor)?.mode,
-      ...(effects.length ? { effects: effects.map((e) => e.effect) } : {}) }, ...(delivered ? {} : { result: 'failed', errorCode: 'delivery-failed' }),
+      ...(effects.length ? { effects: effects.map((e) => e.effect) } : {}) }, ...(delivered ? {} : { result: 'failed', errorCode: d.dnsSyncFailed ? 'provider-dns-sync-failed' : 'delivery-failed' }),
   })
-  if (!delivered) throw new HttpError(502, 'delivery-failed', `version ${version} is active but was not delivered to the router; retry with POST /api/admin/config/redeliver`)
+  if (!delivered) {
+    throw new HttpError(502, d.dnsSyncFailed ? 'provider-dns-sync-failed' : 'delivery-failed', `version ${version} is active but was not delivered to the router${d.dnsSyncFailed ? ' (the DNS Firewall provider allow list could not be updated)' : ''}; retry with POST /api/admin/config/redeliver`)
+  }
   const out: ActivateResponse = { version: v.meta }
   return { status: 201, body: { ...out, warnings: r.warnings } }
 }
@@ -209,17 +274,19 @@ export async function configState(deps: Deps): Promise<ConfigState> {
   const draft = await deps.console.getDraft()
   const eff = await effectiveConfig(deps)
   return {
-    effective: { ...eff.settings, sources: eff.sources, ...(eff.document ? { document: eff.document } : {}), ...(eff.baked ? { bakedVersion: eff.baked.version } : {}) },
+    effective: { ...eff.settings, sources: eff.sources, ...(eff.document ? { document: eff.document } : {}), ...(eff.baked ? { bakedVersion: eff.baked.version } : {}),
+      ...(eff.bakedProviders ? { bakedProviders: eff.bakedProviders } : {}) },
     // What each running task really runs: its latest state line (≤ 15 min), not a scan of past config lines.
     reported: reportedConfigs(await freshStates(deps), eff.settings, deps.now()),
     active: view(active) as ConfigState['active'], ...(draft ? { draft: draft as ConfigState['draft'] } : {}),
     router: await routerState(deps, active),
     delivery: pointer && pointer.n >= 1 && pointer.delivered === false ? { state: 'notDelivered', errorCode: 'delivery-failed' } : { state: 'delivered' },
-    universe: [...deps.env.modelUniverse],
+    // Registry models are routable outside the IAM universe (external providers P3).
+    universe: [...new Set([...deps.env.modelUniverse, ...registryModelIds(deps)])],
     catalog: {
       ...catalogRef(deps),
-      models: deps.catalog.models.map((m) => ({ modelId: m.modelId, tier: m.tier as ConfigState['catalog']['models'][number]['tier'], dialects: [...m.dialects], contextWindow: m.contextWindow,
-        price: { input: m.price.input, output: m.price.output }, ...(m.serviceTier ? { serviceTier: m.serviceTier } : {}) })),
+      models: routingCatalog(deps).models.map((m) => ({ modelId: m.modelId, tier: m.tier as ConfigState['catalog']['models'][number]['tier'], dialects: [...m.dialects], contextWindow: m.contextWindow,
+        price: { input: m.price.input, output: m.price.output }, ...(m.serviceTier ? { serviceTier: m.serviceTier } : {}), ...(m.provider ? { provider: m.provider } : {}) })),
     },
     ...(deps.rules ? { rulesTranslator: { model: deps.rules.model } } : {}),
   }
@@ -282,8 +349,9 @@ export const configHandlers = {
   'admin.config.activate': activate,
   'admin.config.redeliver': async (ctx: Ctx) => {
     const d = await deliver(ctx.deps)
-    await audit(ctx, { action: 'config.redeliver', target: `config:${d.n}`, summary: `redeliver version ${d.n}`, ...(d.delivered ? {} : { result: 'failed', errorCode: 'delivery-failed' }) })
-    if (!d.delivered) throw new HttpError(502, 'delivery-failed', `version ${d.n} could not be delivered`)
+    const code = d.dnsSyncFailed ? 'provider-dns-sync-failed' : 'delivery-failed'
+    await audit(ctx, { action: 'config.redeliver', target: `config:${d.n}`, summary: `redeliver version ${d.n}`, ...(d.delivered ? {} : { result: 'failed', errorCode: code }) })
+    if (!d.delivered) throw new HttpError(502, code, `version ${d.n} could not be delivered${d.dnsSyncFailed ? ' (the DNS Firewall provider allow list could not be updated)' : ''}`)
     return { body: await configState(ctx.deps) }
   },
 } satisfies Record<string, Handler>

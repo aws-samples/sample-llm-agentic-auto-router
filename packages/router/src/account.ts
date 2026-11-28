@@ -33,6 +33,11 @@ export interface RequestLog {
   clientSession?: string
   decision?: Pick<Decision, 'action' | 'point' | 'mode' | 'model' | 'reason' | 'policyVersion'> & Partial<Pick<Decision, 'wouldChoose' | 'estimate' | 'projected' | 'projectedAssessed'>>
   servedModel?: string
+  /**
+   * The provider of the request's model (11-28 external providers): 'bedrock' or a registry provider id (a code). An
+   * EMF property, never a dimension. Never the provider's baseUrl or key.
+   */
+  provider?: string
   stream?: boolean
   usage?: NormalizedUsage
   costUsd?: CostBreakdown
@@ -58,6 +63,11 @@ export interface RequestLog {
   /** The request is a client's one-off side call (core hints): 'thread-title' = the Codex TUI's title request. */
   sideCall?: SideCall
   failover?: { from: string; to: string; status: number | string }
+  /**
+   * 400 `pin-not-portable` (11-28 external providers): the state tags that kept a cross-provider pin from being served
+   * (e.g. 'anthropic-thinking-signature', 'previous-response-id'). Codes only.
+   */
+  pinNotPortable?: string[]
   betaVeto?: string
   headers?: Partial<Record<(typeof LOGGED_HEADERS)[number], string>>
   reason?: string
@@ -303,6 +313,7 @@ export function emf(log: RequestLog, nowMs: number, known?: ReadonlySet<string>)
   for (const m of metrics) doc[m.Name] = m.v
   if (log.miss) doc.MissReason = log.miss.reason
   if (log.upstreamError) doc.UpstreamError = log.upstreamError
+  if (log.provider) doc.Provider = log.provider
   if (alert) { doc.Alerts = 1; doc.AlertReason = alert }
   doc.Status = log.status
   return doc

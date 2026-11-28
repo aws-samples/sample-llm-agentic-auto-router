@@ -252,6 +252,11 @@ describe('model names', () => {
     expect(['global.anthropic.claude-fable-5-2', OPUS, SONNET, 'global.anthropic.claude-haiku-4-5-20251001-v1:0', 'global.openai.gpt-6.1-sol', 'global.openai.gpt-6-luna', 'global.moonshotai.kimi-k3', 'jp.anthropic.claude-opus-5-5', 'global.anthropic.claude-fable-5'].map(modelName))
       .toEqual(['Fable 5.2', 'Opus 5.5', 'Sonnet 5.5', 'Haiku 4.5', 'GPT-6.1 Sol', 'GPT-6 Luna', 'Kimi K3', 'Opus 5.5', 'Fable 5'])
   })
+  it('provider registry models: the upstream name, then the provider', () => {
+    expect(modelName('litellm/gpt-6-luna')).toBe('GPT-6 Luna (litellm)')
+    expect(modelName('litellm/claude-haiku-5-5')).toBe('Haiku 5.5 (litellm)')
+    expect(modelName('openrouter/deepseek/deepseek-v4')).toBe('deepseek/deepseek-v4 (openrouter)')
+  })
   it('v11 helper keeps the version it is given', () => {
     expect(v11('3-20261101T000000Z').version).toBe('3-20261101T000000Z')
   })

@@ -1,4 +1,5 @@
 import { UsageNotFoundError } from './errors.ts'
+import type { UsageQuirks } from './providers.ts'
 import type { CacheTtl, Dialect, NormalizedUsage, StreamUsageAccumulator } from './types.ts'
 
 type Obj = Record<string, unknown>
@@ -6,14 +7,18 @@ type Obj = Record<string, unknown>
 /** Cache-write TTL attributed to OpenAI-shape writes when the response carries no TTL breakdown. */
 export const OPENAI_DEFAULT_WRITE_TTL: CacheTtl = '30m'
 
+/** Per-provider usage quirks (a registry provider's `quirks`; only `usage` is read). */
+export interface UsageOptions { usage?: UsageQuirks }
+
 /**
  * Normalizes the usage of a non-streaming response body (or any object carrying `usage`,
  * `response.usage` or `message.usage`). Throws UsageNotFoundError when no usage object exists.
+ * `quirks.usage` names non-standard fields that override the standard cache read / write counts.
  */
-export function normalizeUsage(dialect: Dialect, responseBody: unknown): NormalizedUsage {
+export function normalizeUsage(dialect: Dialect, responseBody: unknown, quirks?: UsageOptions): NormalizedUsage {
   const usage = findUsage(responseBody)
   if (!usage) throw new UsageNotFoundError(`${dialect}: response body has no usage object`)
-  return dialect === 'anthropic-messages' ? fromAnthropic(usage) : fromOpenAi(dialect, usage)
+  return fromDialect(dialect, usage, quirks?.usage)
 }
 
 /**
@@ -23,7 +28,8 @@ export function normalizeUsage(dialect: Dialect, responseBody: unknown): Normali
  * - openai-responses: `response.completed` / `response.incomplete` / `response.failed` → `response.usage`.
  * `push` never throws; non-JSON data (e.g. `[DONE]`) is skipped.
  */
-export function createStreamUsageAccumulator(dialect: Dialect): StreamUsageAccumulator {
+export function createStreamUsageAccumulator(dialect: Dialect, quirks?: UsageOptions): StreamUsageAccumulator {
+  const usageQuirks = quirks?.usage
   let merged: Obj | undefined
   return {
     push(event) {
@@ -50,9 +56,48 @@ export function createStreamUsageAccumulator(dialect: Dialect): StreamUsageAccum
     },
     result() {
       if (!merged) return undefined
-      return dialect === 'anthropic-messages' ? fromAnthropic(merged) : fromOpenAi(dialect, merged)
+      return fromDialect(dialect, merged, usageQuirks)
     },
   }
+}
+
+function fromDialect(dialect: Dialect, u: Obj, quirks: UsageQuirks | undefined): NormalizedUsage {
+  const anthropic = dialect === 'anthropic-messages'
+  const std = anthropic ? fromAnthropic(u) : fromOpenAi(dialect, u)
+  return quirks ? applyQuirks(std, u, quirks, anthropic ? '5m' : OPENAI_DEFAULT_WRITE_TTL, anthropic) : std
+}
+
+/**
+ * Overrides the cache read / write counts with the provider's own fields when the response carries them (a field
+ * that is absent keeps the standard count). A quirk write total is attributed to the dialect's default TTL.
+ * OpenAI shapes count cached tokens inside the prompt total, so uncached = prompt − read − written; Anthropic
+ * input_tokens already excludes them.
+ */
+function applyQuirks(std: NormalizedUsage, u: Obj, q: UsageQuirks, writeTtl: CacheTtl, anthropic: boolean): NormalizedUsage {
+  const read = q.cacheReadTokens !== undefined ? pathNum(u, q.cacheReadTokens) : undefined
+  const written = q.cacheWriteTokens !== undefined ? pathNum(u, q.cacheWriteTokens) : undefined
+  if (read === undefined && written === undefined) return std
+  const out: NormalizedUsage = { ...std, cacheWriteTokens: { ...std.cacheWriteTokens } }
+  if (read !== undefined) out.cacheReadTokens = read
+  if (written !== undefined) {
+    out.cacheWriteTokens = {}
+    addWrite(out.cacheWriteTokens, writeTtl, written)
+  }
+  const writes = sumWrites(out.cacheWriteTokens)
+  if (!anthropic) out.uncachedInputTokens = Math.max(0, std.promptTokens - out.cacheReadTokens - writes)
+  out.promptTokens = out.uncachedInputTokens + out.cacheReadTokens + writes
+  return out
+}
+
+/** The number at a dot path inside `u`, or undefined when the path does not lead to a finite number. */
+function pathNum(u: Obj, path: string): number | undefined {
+  let cur: unknown = u
+  for (const key of path.split('.')) {
+    const o = asObj(cur)
+    if (!o || !Object.hasOwn(o, key)) return undefined
+    cur = o[key]
+  }
+  return typeof cur === 'number' && Number.isFinite(cur) ? Math.max(0, cur) : undefined
 }
 
 function fromAnthropic(u: Obj): NormalizedUsage {

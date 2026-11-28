@@ -7,7 +7,8 @@
 // MOCK_TOKEN_TTL (access token seconds, default 900), MOCK_LATENCY_MS, MOCK_TOKEN_STORAGE (session | memory),
 // MOCK_MODE=observe (router in observe mode: config v1 only, every record observe), MOCK_ROUTING=v11 (the live
 // routing document as the active version), MOCK_RULES_MODEL=none (natural-language rules off), MOCK_CATALOG=held|blocked|off
-// (dynamic catalog demo states), MOCK_GRANT_MS / MOCK_REFRESH_MS (simulated grant and refresh durations).
+// (dynamic catalog demo states), MOCK_GRANT_MS / MOCK_REFRESH_MS (simulated grant and refresh durations),
+// MOCK_PROVIDER_KEYS=off (no provider secret prefix: key routes answer 503), MOCK_BOUNDARY=none (no egress mode, no providers).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createApi } from './api.ts'
@@ -15,6 +16,7 @@ import type { IdentityKeysReason } from '@auto-router/console-contract'
 import { v11 } from '../src/pages/admin/routing/fixtures.ts'
 import type { CatalogScenario } from './catalog.ts'
 import { buildDb, configVersion, KEY_STATES, PREFIX } from './data.ts'
+import { NO_BOUNDARY } from './providers.ts'
 import { createIdp } from './idp.ts'
 import { JwtKey } from './jwt.ts'
 
@@ -54,6 +56,10 @@ export interface MockOptions {
   /** Simulated grant / refresh function durations (MOCK_GRANT_MS, MOCK_REFRESH_MS; default 1500 each). */
   grantMs?: number
   refreshMs?: number
+  /** ADR 0002: no provider secret prefix (MOCK_PROVIDER_KEYS=off): the key routes answer 503 provider-keys-unavailable. */
+  noProviderKeys?: boolean
+  /** ADR 0002: a deployment without an egress mode (MOCK_BOUNDARY=none): no providers, none allowed. */
+  noBoundary?: boolean
 }
 
 export async function startMock(opts: MockOptions = {}): Promise<MockStack> {
@@ -76,6 +82,8 @@ export async function startMock(opts: MockOptions = {}): Promise<MockStack> {
   })
   const db = buildDb(Date.now(), opts.effective ?? 'document', opts.mode ?? 'auto', opts.catalog ?? 'default')
   if (opts.reportedMismatch) db.reportedMismatch = true
+  if (opts.noProviderKeys) delete db.secretPrefix
+  if (opts.noBoundary) { db.boundary = NO_BOUNDARY; delete db.baked.providers }
   if (opts.noTranslator) delete db.rulesTranslator
   if (opts.routing === 'v11') {
     const at = Date.now() - 3600_000
@@ -121,6 +129,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     ...(env.MOCK_MODE === 'observe' ? { mode: 'observe' as const } : {}),
     ...(env.MOCK_ROUTING === 'v11' ? { routing: 'v11' as const } : {}),
     noTranslator: env.MOCK_RULES_MODEL === 'none',
+    noProviderKeys: env.MOCK_PROVIDER_KEYS === 'off',
+    noBoundary: env.MOCK_BOUNDARY === 'none',
     ...(env.MOCK_CONFIG_FAILURE === '404' || env.MOCK_CONFIG_FAILURE === '503' ? { configFailure: Number(env.MOCK_CONFIG_FAILURE) as 404 | 503 } : {}),
     ...(env.MOCK_CATALOG === 'held' || env.MOCK_CATALOG === 'blocked' || env.MOCK_CATALOG === 'off' ? { catalog: env.MOCK_CATALOG } : {}),
     ...(env.MOCK_GRANT_MS ? { grantMs: Number(env.MOCK_GRANT_MS) } : {}),
